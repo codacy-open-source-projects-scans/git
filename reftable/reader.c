@@ -67,7 +67,7 @@ static int reader_get_block(struct reftable_reader *r,
 	return block_source_read_block(&r->source, dest, off, sz);
 }
 
-uint32_t reftable_reader_hash_id(struct reftable_reader *r)
+enum reftable_hash reftable_reader_hash_id(struct reftable_reader *r)
 {
 	return r->hash_id;
 }
@@ -107,18 +107,20 @@ static int parse_footer(struct reftable_reader *r, uint8_t *footer,
 	f += 8;
 
 	if (r->version == 1) {
-		r->hash_id = GIT_SHA1_FORMAT_ID;
+		r->hash_id = REFTABLE_HASH_SHA1;
 	} else {
-		r->hash_id = get_be32(f);
-		switch (r->hash_id) {
-		case GIT_SHA1_FORMAT_ID:
+		switch (get_be32(f)) {
+		case REFTABLE_FORMAT_ID_SHA1:
+			r->hash_id = REFTABLE_HASH_SHA1;
 			break;
-		case GIT_SHA256_FORMAT_ID:
+		case REFTABLE_FORMAT_ID_SHA256:
+			r->hash_id = REFTABLE_HASH_SHA256;
 			break;
 		default:
 			err = REFTABLE_FORMAT_ERROR;
 			goto done;
 		}
+
 		f += 4;
 	}
 
@@ -350,13 +352,15 @@ static int table_iter_seek_start(struct table_iter *ti, uint8_t typ, int index)
 static int table_iter_seek_linear(struct table_iter *ti,
 				  struct reftable_record *want)
 {
-	struct strbuf want_key = STRBUF_INIT;
-	struct strbuf got_key = STRBUF_INIT;
+	struct reftable_buf want_key = REFTABLE_BUF_INIT;
+	struct reftable_buf got_key = REFTABLE_BUF_INIT;
 	struct reftable_record rec;
 	int err;
 
 	reftable_record_init(&rec, reftable_record_type(want));
-	reftable_record_key(want, &want_key);
+	err = reftable_record_key(want, &want_key);
+	if (err < 0)
+		goto done;
 
 	/*
 	 * First we need to locate the block that must contain our record. To
@@ -401,7 +405,7 @@ static int table_iter_seek_linear(struct table_iter *ti,
 		if (err < 0)
 			goto done;
 
-		if (strbuf_cmp(&got_key, &want_key) > 0) {
+		if (reftable_buf_cmp(&got_key, &want_key) > 0) {
 			table_iter_block_done(&next);
 			break;
 		}
@@ -422,8 +426,8 @@ static int table_iter_seek_linear(struct table_iter *ti,
 
 done:
 	reftable_record_release(&rec);
-	strbuf_release(&want_key);
-	strbuf_release(&got_key);
+	reftable_buf_release(&want_key);
+	reftable_buf_release(&got_key);
 	return err;
 }
 
@@ -431,15 +435,17 @@ static int table_iter_seek_indexed(struct table_iter *ti,
 				   struct reftable_record *rec)
 {
 	struct reftable_record want_index = {
-		.type = BLOCK_TYPE_INDEX, .u.idx = { .last_key = STRBUF_INIT }
+		.type = BLOCK_TYPE_INDEX, .u.idx = { .last_key = REFTABLE_BUF_INIT }
 	};
 	struct reftable_record index_result = {
 		.type = BLOCK_TYPE_INDEX,
-		.u.idx = { .last_key = STRBUF_INIT },
+		.u.idx = { .last_key = REFTABLE_BUF_INIT },
 	};
 	int err;
 
-	reftable_record_key(rec, &want_index.u.idx.last_key);
+	err = reftable_record_key(rec, &want_index.u.idx.last_key);
+	if (err < 0)
+		goto done;
 
 	/*
 	 * The index may consist of multiple levels, where each level may have
@@ -765,7 +771,10 @@ static int reftable_reader_refs_for_unindexed(struct reftable_reader *r,
 	}
 	*filter = empty;
 
-	strbuf_add(&filter->oid, oid, oid_len);
+	err = reftable_buf_add(&filter->oid, oid, oid_len);
+	if (err < 0)
+		goto out;
+
 	iterator_from_table_iter(&filter->it, ti);
 
 	iterator_from_filtering_ref_iterator(it, filter);

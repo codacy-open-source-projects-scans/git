@@ -79,7 +79,7 @@ static void options_set_defaults(struct reftable_write_options *opts)
 	}
 
 	if (opts->hash_id == 0) {
-		opts->hash_id = GIT_SHA1_FORMAT_ID;
+		opts->hash_id = REFTABLE_HASH_SHA1;
 	}
 	if (opts->block_size == 0) {
 		opts->block_size = DEFAULT_BLOCK_SIZE;
@@ -88,7 +88,7 @@ static void options_set_defaults(struct reftable_write_options *opts)
 
 static int writer_version(struct reftable_writer *w)
 {
-	return (w->opts.hash_id == 0 || w->opts.hash_id == GIT_SHA1_FORMAT_ID) ?
+	return (w->opts.hash_id == 0 || w->opts.hash_id == REFTABLE_HASH_SHA1) ?
 			     1 :
 			     2;
 }
@@ -103,8 +103,22 @@ static int writer_write_header(struct reftable_writer *w, uint8_t *dest)
 	put_be64(dest + 8, w->min_update_index);
 	put_be64(dest + 16, w->max_update_index);
 	if (writer_version(w) == 2) {
-		put_be32(dest + 24, w->opts.hash_id);
+		uint32_t hash_id;
+
+		switch (w->opts.hash_id) {
+		case REFTABLE_HASH_SHA1:
+			hash_id = REFTABLE_FORMAT_ID_SHA1;
+			break;
+		case REFTABLE_HASH_SHA256:
+			hash_id = REFTABLE_FORMAT_ID_SHA256;
+			break;
+		default:
+			return -1;
+		}
+
+		put_be32(dest + 24, hash_id);
 	}
+
 	return header_size(writer_version(w));
 }
 
@@ -115,7 +129,7 @@ static int writer_reinit_block_writer(struct reftable_writer *w, uint8_t typ)
 	if (w->next == 0)
 		block_start = header_size(writer_version(w));
 
-	strbuf_reset(&w->last_key);
+	reftable_buf_reset(&w->last_key);
 	ret = block_writer_init(&w->block_writer_data, typ, w->block,
 				w->opts.block_size, block_start,
 				hash_size(w->opts.hash_id));
@@ -146,8 +160,9 @@ int reftable_writer_new(struct reftable_writer **out,
 	if (opts.block_size >= (1 << 24))
 		BUG("configured block size exceeds 16MB");
 
-	strbuf_init(&wp->block_writer_data.last_key, 0);
-	strbuf_init(&wp->last_key, 0);
+	reftable_buf_init(&wp->block_writer_data.last_key);
+	reftable_buf_init(&wp->last_key);
+	reftable_buf_init(&wp->scratch);
 	REFTABLE_CALLOC_ARRAY(wp->block, opts.block_size);
 	if (!wp->block) {
 		reftable_free(wp);
@@ -179,7 +194,8 @@ static void writer_release(struct reftable_writer *w)
 		block_writer_release(&w->block_writer_data);
 		w->block_writer = NULL;
 		writer_clear_index(w);
-		strbuf_release(&w->last_key);
+		reftable_buf_release(&w->last_key);
+		reftable_buf_release(&w->scratch);
 	}
 }
 
@@ -190,7 +206,7 @@ void reftable_writer_free(struct reftable_writer *w)
 }
 
 struct obj_index_tree_node {
-	struct strbuf hash;
+	struct reftable_buf hash;
 	uint64_t *offsets;
 	size_t offset_len;
 	size_t offset_cap;
@@ -198,16 +214,16 @@ struct obj_index_tree_node {
 
 #define OBJ_INDEX_TREE_NODE_INIT    \
 	{                           \
-		.hash = STRBUF_INIT \
+		.hash = REFTABLE_BUF_INIT \
 	}
 
 static int obj_index_tree_node_compare(const void *a, const void *b)
 {
-	return strbuf_cmp(&((const struct obj_index_tree_node *)a)->hash,
+	return reftable_buf_cmp(&((const struct obj_index_tree_node *)a)->hash,
 			  &((const struct obj_index_tree_node *)b)->hash);
 }
 
-static int writer_index_hash(struct reftable_writer *w, struct strbuf *hash)
+static int writer_index_hash(struct reftable_writer *w, struct reftable_buf *hash)
 {
 	uint64_t off = w->next;
 	struct obj_index_tree_node want = { .hash = *hash };
@@ -217,6 +233,7 @@ static int writer_index_hash(struct reftable_writer *w, struct strbuf *hash)
 	node = tree_search(w->obj_index_tree, &want, &obj_index_tree_node_compare);
 	if (!node) {
 		struct obj_index_tree_node empty = OBJ_INDEX_TREE_NODE_INIT;
+		int err;
 
 		key = reftable_malloc(sizeof(*key));
 		if (!key)
@@ -224,8 +241,10 @@ static int writer_index_hash(struct reftable_writer *w, struct strbuf *hash)
 
 		*key = empty;
 
-		strbuf_reset(&key->hash);
-		strbuf_addbuf(&key->hash, hash);
+		reftable_buf_reset(&key->hash);
+		err = reftable_buf_add(&key->hash, hash->buf, hash->len);
+		if (err < 0)
+			return err;
 		tree_insert(&w->obj_index_tree, key,
 			    &obj_index_tree_node_compare);
 	} else {
@@ -246,17 +265,22 @@ static int writer_index_hash(struct reftable_writer *w, struct strbuf *hash)
 static int writer_add_record(struct reftable_writer *w,
 			     struct reftable_record *rec)
 {
-	struct strbuf key = STRBUF_INIT;
 	int err;
 
-	reftable_record_key(rec, &key);
-	if (strbuf_cmp(&w->last_key, &key) >= 0) {
+	err = reftable_record_key(rec, &w->scratch);
+	if (err < 0)
+		goto done;
+
+	if (reftable_buf_cmp(&w->last_key, &w->scratch) >= 0) {
 		err = REFTABLE_API_ERROR;
 		goto done;
 	}
 
-	strbuf_reset(&w->last_key);
-	strbuf_addbuf(&w->last_key, &key);
+	reftable_buf_reset(&w->last_key);
+	err = reftable_buf_add(&w->last_key, w->scratch.buf, w->scratch.len);
+	if (err < 0)
+		goto done;
+
 	if (!w->block_writer) {
 		err = writer_reinit_block_writer(w, reftable_record_type(rec));
 		if (err < 0)
@@ -303,7 +327,6 @@ static int writer_add_record(struct reftable_writer *w,
 	}
 
 done:
-	strbuf_release(&key);
 	return err;
 }
 
@@ -316,7 +339,6 @@ int reftable_writer_add_ref(struct reftable_writer *w,
 			.ref = *ref
 		},
 	};
-	struct strbuf buf = STRBUF_INIT;
 	int err;
 
 	if (!ref->refname ||
@@ -331,20 +353,25 @@ int reftable_writer_add_ref(struct reftable_writer *w,
 		goto out;
 
 	if (!w->opts.skip_index_objects && reftable_ref_record_val1(ref)) {
-		strbuf_add(&buf, (char *)reftable_ref_record_val1(ref),
-			   hash_size(w->opts.hash_id));
+		reftable_buf_reset(&w->scratch);
+		err = reftable_buf_add(&w->scratch, (char *)reftable_ref_record_val1(ref),
+				       hash_size(w->opts.hash_id));
+		if (err < 0)
+			goto out;
 
-		err = writer_index_hash(w, &buf);
+		err = writer_index_hash(w, &w->scratch);
 		if (err < 0)
 			goto out;
 	}
 
 	if (!w->opts.skip_index_objects && reftable_ref_record_val2(ref)) {
-		strbuf_reset(&buf);
-		strbuf_add(&buf, reftable_ref_record_val2(ref),
-			   hash_size(w->opts.hash_id));
+		reftable_buf_reset(&w->scratch);
+		err = reftable_buf_add(&w->scratch, reftable_ref_record_val2(ref),
+				       hash_size(w->opts.hash_id));
+		if (err < 0)
+			goto out;
 
-		err = writer_index_hash(w, &buf);
+		err = writer_index_hash(w, &w->scratch);
 		if (err < 0)
 			goto out;
 	}
@@ -352,7 +379,6 @@ int reftable_writer_add_ref(struct reftable_writer *w,
 	err = 0;
 
 out:
-	strbuf_release(&buf);
 	return err;
 }
 
@@ -393,7 +419,7 @@ int reftable_writer_add_log(struct reftable_writer *w,
 			    struct reftable_log_record *log)
 {
 	char *input_log_message = NULL;
-	struct strbuf cleaned_message = STRBUF_INIT;
+	struct reftable_buf cleaned_message = REFTABLE_BUF_INIT;
 	int err = 0;
 
 	if (log->value_type == REFTABLE_LOG_DELETION)
@@ -404,24 +430,34 @@ int reftable_writer_add_log(struct reftable_writer *w,
 
 	input_log_message = log->value.update.message;
 	if (!w->opts.exact_log_message && log->value.update.message) {
-		strbuf_addstr(&cleaned_message, log->value.update.message);
+		err = reftable_buf_addstr(&cleaned_message, log->value.update.message);
+		if (err < 0)
+			goto done;
+
 		while (cleaned_message.len &&
-		       cleaned_message.buf[cleaned_message.len - 1] == '\n')
-			strbuf_setlen(&cleaned_message,
-				      cleaned_message.len - 1);
+		       cleaned_message.buf[cleaned_message.len - 1] == '\n') {
+			err = reftable_buf_setlen(&cleaned_message,
+						  cleaned_message.len - 1);
+			if (err < 0)
+				goto done;
+		}
 		if (strchr(cleaned_message.buf, '\n')) {
 			/* multiple lines not allowed. */
 			err = REFTABLE_API_ERROR;
 			goto done;
 		}
-		strbuf_addstr(&cleaned_message, "\n");
+
+		err = reftable_buf_addstr(&cleaned_message, "\n");
+		if (err < 0)
+			goto done;
+
 		log->value.update.message = cleaned_message.buf;
 	}
 
 	err = reftable_writer_add_log_verbatim(w, log);
 	log->value.update.message = input_log_message;
 done:
-	strbuf_release(&cleaned_message);
+	reftable_buf_release(&cleaned_message);
 	return err;
 }
 
@@ -504,7 +540,7 @@ static int writer_finish_section(struct reftable_writer *w)
 			return err;
 
 		for (i = 0; i < idx_len; i++)
-			strbuf_release(&idx[i].last_key);
+			reftable_buf_release(&idx[i].last_key);
 		reftable_free(idx);
 	}
 
@@ -521,13 +557,13 @@ static int writer_finish_section(struct reftable_writer *w)
 	bstats->max_index_level = max_level;
 
 	/* Reinit lastKey, as the next section can start with any key. */
-	strbuf_reset(&w->last_key);
+	reftable_buf_reset(&w->last_key);
 
 	return 0;
 }
 
 struct common_prefix_arg {
-	struct strbuf *last;
+	struct reftable_buf *last;
 	int max;
 };
 
@@ -594,7 +630,7 @@ static void object_record_free(void *void_arg UNUSED, void *key)
 	struct obj_index_tree_node *entry = key;
 
 	REFTABLE_FREE_AND_NULL(entry->offsets);
-	strbuf_release(&entry->hash);
+	reftable_buf_release(&entry->hash);
 	reftable_free(entry);
 }
 
@@ -708,7 +744,7 @@ done:
 static void writer_clear_index(struct reftable_writer *w)
 {
 	for (size_t i = 0; w->index && i < w->index_len; i++)
-		strbuf_release(&w->index[i].last_key);
+		reftable_buf_release(&w->index[i].last_key);
 	REFTABLE_FREE_AND_NULL(w->index);
 	w->index_len = 0;
 	w->index_cap = 0;
@@ -717,7 +753,7 @@ static void writer_clear_index(struct reftable_writer *w)
 static int writer_flush_nonempty_block(struct reftable_writer *w)
 {
 	struct reftable_index_record index_record = {
-		.last_key = STRBUF_INIT,
+		.last_key = REFTABLE_BUF_INIT,
 	};
 	uint8_t typ = block_writer_type(w->block_writer);
 	struct reftable_block_stats *bstats;
@@ -777,8 +813,11 @@ static int writer_flush_nonempty_block(struct reftable_writer *w)
 		return REFTABLE_OUT_OF_MEMORY_ERROR;
 
 	index_record.offset = w->next;
-	strbuf_reset(&index_record.last_key);
-	strbuf_addbuf(&index_record.last_key, &w->block_writer->last_key);
+	reftable_buf_reset(&index_record.last_key);
+	err = reftable_buf_add(&index_record.last_key, w->block_writer->last_key.buf,
+			       w->block_writer->last_key.len);
+	if (err < 0)
+		return err;
 	w->index[w->index_len] = index_record;
 	w->index_len++;
 
