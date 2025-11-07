@@ -31,6 +31,14 @@ struct worktree {
 struct worktree **get_worktrees(void);
 
 /*
+ * Like `get_worktrees`, but does not read HEAD. Skip reading HEAD allows to
+ * get the worktree without worrying about failures pertaining to parsing
+ * the HEAD ref. This is useful in contexts where it is assumed that the
+ * refdb may not be in a consistent state.
+ */
+struct worktree **get_worktrees_without_reading_head(void);
+
+/*
  * Returns 1 if linked worktrees exist, 0 otherwise.
  */
 int submodule_uses_worktrees(const char *path);
@@ -39,7 +47,7 @@ int submodule_uses_worktrees(const char *path);
  * Return git dir of the worktree. Note that the path may be relative.
  * If wt is NULL, git dir of current worktree is returned.
  */
-const char *get_worktree_git_dir(const struct worktree *wt);
+char *get_worktree_git_dir(const struct worktree *wt);
 
 /*
  * Search for the worktree identified unambiguously by `arg` -- typically

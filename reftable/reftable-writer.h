@@ -1,10 +1,10 @@
 /*
-Copyright 2020 Google LLC
-
-Use of this source code is governed by a BSD-style
-license that can be found in the LICENSE file or at
-https://developers.google.com/open-source/licenses/bsd
-*/
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style
+ * license that can be found in the LICENSE file or at
+ * https://developers.google.com/open-source/licenses/bsd
+ */
 
 #ifndef REFTABLE_WRITER_H
 #define REFTABLE_WRITER_H
@@ -84,7 +84,7 @@ struct reftable_block_stats {
 	/* total number of entries written */
 	int entries;
 	/* total number of key restarts */
-	int restarts;
+	uint32_t restarts;
 	/* total number of blocks */
 	int blocks;
 	/* total number of index blocks */
@@ -124,17 +124,21 @@ int reftable_writer_new(struct reftable_writer **out,
 			int (*flush_func)(void *),
 			void *writer_arg, const struct reftable_write_options *opts);
 
-/* Set the range of update indices for the records we will add. When writing a
-   table into a stack, the min should be at least
-   reftable_stack_next_update_index(), or REFTABLE_API_ERROR is returned.
-
-   For transactional updates to a stack, typically min==max, and the
-   update_index can be obtained by inspeciting the stack. When converting an
-   existing ref database into a single reftable, this would be a range of
-   update-index timestamps.
+/*
+ * Set the range of update indices for the records we will add. When writing a
+ * table into a stack, the min should be at least
+ * reftable_stack_next_update_index(), or REFTABLE_API_ERROR is returned.
+ *
+ * For transactional updates to a stack, typically min==max, and the
+ * update_index can be obtained by inspeciting the stack. When converting an
+ * existing ref database into a single reftable, this would be a range of
+ * update-index timestamps.
+ *
+ * The function should be called before adding any records to the writer. If not
+ * it will fail with REFTABLE_API_ERROR.
  */
-void reftable_writer_set_limits(struct reftable_writer *w, uint64_t min,
-				uint64_t max);
+int reftable_writer_set_limits(struct reftable_writer *w, uint64_t min,
+			       uint64_t max);
 
 /*
   Add a reftable_ref_record. The record should have names that come after
@@ -152,7 +156,7 @@ int reftable_writer_add_ref(struct reftable_writer *w,
   the records before adding them, reordering the records array passed in.
 */
 int reftable_writer_add_refs(struct reftable_writer *w,
-			     struct reftable_ref_record *refs, int n);
+			     struct reftable_ref_record *refs, size_t n);
 
 /*
   adds reftable_log_records. Log records are keyed by (refname, decreasing
@@ -167,7 +171,7 @@ int reftable_writer_add_log(struct reftable_writer *w,
   the records before adding them, reordering records array passed in.
 */
 int reftable_writer_add_logs(struct reftable_writer *w,
-			     struct reftable_log_record *logs, int n);
+			     struct reftable_log_record *logs, size_t n);
 
 /* reftable_writer_close finalizes the reftable. The writer is retained so
  * statistics can be inspected. */

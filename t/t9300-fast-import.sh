@@ -120,7 +120,7 @@ test_expect_success 'A: create pack from stdin' '
 
 	INPUT_END
 	git fast-import --export-marks=marks.out <input &&
-	git whatchanged main
+	git log --raw main
 '
 
 test_expect_success 'A: verify pack' '
@@ -279,7 +279,7 @@ test_expect_success 'A: verify marks import does not crash' '
 	INPUT_END
 
 	git fast-import --import-marks=marks.out <input &&
-	git whatchanged verify--import-marks
+	git log --raw verify--import-marks
 '
 
 test_expect_success 'A: verify pack' '
@@ -652,7 +652,7 @@ test_expect_success 'C: incremental import create pack from stdin' '
 	INPUT_END
 
 	git fast-import <input &&
-	git whatchanged branch
+	git log --raw branch
 '
 
 test_expect_success 'C: verify pack' '
@@ -715,7 +715,7 @@ test_expect_success 'D: inline data in commit' '
 	INPUT_END
 
 	git fast-import <input &&
-	git whatchanged branch
+	git log --raw branch
 '
 
 test_expect_success 'D: verify pack' '
@@ -882,7 +882,7 @@ test_expect_success 'H: deletall, add 1' '
 
 	INPUT_END
 	git fast-import <input &&
-	git whatchanged H
+	git log --raw H
 '
 
 test_expect_success 'H: verify pack' '
@@ -2066,7 +2066,7 @@ test_expect_success 'Q: commit notes' '
 	INPUT_END
 
 	git fast-import <input &&
-	git whatchanged notes-test
+	git log --raw notes-test
 '
 
 test_expect_success 'Q: verify pack' '
@@ -2927,16 +2927,16 @@ test_expect_success 'R: blob appears only once' '
 # The error message when a space is missing not at the
 # end of the line is:
 #
-#   Missing space after ..
+#   missing space after ..
 #
 # or when extra characters come after the mark at the end
 # of the line:
 #
-#   Garbage after ..
+#   garbage after ..
 #
 # or when the dataref is neither "inline " or a known SHA1,
 #
-#   Invalid dataref ..
+#   invalid dataref ..
 #
 test_expect_success 'S: initialize for S tests' '
 	test_tick &&
@@ -3405,15 +3405,15 @@ test_path_fail () {
 
 test_path_base_fail () {
 	local change="$1" prefix="$2" field="$3" suffix="$4"
-	test_path_fail "$change" 'unclosed " in '"$field"          "$prefix" '"hello.c'    "$suffix" "Invalid $field"
-	test_path_fail "$change" "invalid escape in quoted $field" "$prefix" '"hello\xff"' "$suffix" "Invalid $field"
+	test_path_fail "$change" 'unclosed " in '"$field"          "$prefix" '"hello.c'    "$suffix" "invalid $field"
+	test_path_fail "$change" "invalid escape in quoted $field" "$prefix" '"hello\xff"' "$suffix" "invalid $field"
 	test_path_fail "$change" "escaped NUL in quoted $field"    "$prefix" '"hello\000"' "$suffix" "NUL in $field"
 }
 test_path_eol_quoted_fail () {
 	local change="$1" prefix="$2" field="$3"
 	test_path_base_fail "$change" "$prefix" "$field" ''
-	test_path_fail "$change" "garbage after quoted $field" "$prefix" '"hello.c"' 'x' "Garbage after $field"
-	test_path_fail "$change" "space after quoted $field"   "$prefix" '"hello.c"' ' ' "Garbage after $field"
+	test_path_fail "$change" "garbage after quoted $field" "$prefix" '"hello.c"' 'x' "garbage after $field"
+	test_path_fail "$change" "space after quoted $field"   "$prefix" '"hello.c"' ' ' "garbage after $field"
 }
 test_path_eol_fail () {
 	local change="$1" prefix="$2" field="$3"
@@ -3422,8 +3422,8 @@ test_path_eol_fail () {
 test_path_space_fail () {
 	local change="$1" prefix="$2" field="$3"
 	test_path_base_fail "$change" "$prefix" "$field" ' world.c'
-	test_path_fail "$change" "missing space after quoted $field"   "$prefix" '"hello.c"' 'x world.c' "Missing space after $field"
-	test_path_fail "$change" "missing space after unquoted $field" "$prefix" 'hello.c'   ''          "Missing space after $field"
+	test_path_fail "$change" "missing space after quoted $field"   "$prefix" '"hello.c"' 'x world.c' "missing space after $field"
+	test_path_fail "$change" "missing space after unquoted $field" "$prefix" 'hello.c'   ''          "missing space after $field"
 }
 
 test_path_eol_fail   filemodify       'M 100644 :1 ' path
@@ -3820,7 +3820,7 @@ test_expect_success 'X: replace ref that becomes useless is removed' '
 		sed -e s/othername/somename/ tmp >tmp2 &&
 		git fast-import --force <tmp2 2>msgs &&
 
-		grep "Dropping.*since it would point to itself" msgs &&
+		grep "dropping.*since it would point to itself" msgs &&
 		git show-ref >refs &&
 		! grep refs/replace refs
 	)

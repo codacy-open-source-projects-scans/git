@@ -6,20 +6,21 @@
 #include "../config.h"
 #include "../dir.h"
 #include "../environment.h"
+#include "../fsck.h"
 #include "../gettext.h"
 #include "../hash.h"
 #include "../hex.h"
 #include "../iterator.h"
 #include "../ident.h"
-#include "../lockfile.h"
 #include "../object.h"
 #include "../path.h"
 #include "../refs.h"
 #include "../reftable/reftable-basics.h"
-#include "../reftable/reftable-stack.h"
-#include "../reftable/reftable-record.h"
 #include "../reftable/reftable-error.h"
+#include "../reftable/reftable-fsck.h"
 #include "../reftable/reftable-iterator.h"
+#include "../reftable/reftable-record.h"
+#include "../reftable/reftable-stack.h"
 #include "../repo-settings.h"
 #include "../setup.h"
 #include "../strmap.h"
@@ -380,13 +381,13 @@ static struct ref_store *reftable_be_init(struct repository *repo,
 	default:
 		BUG("unknown hash algorithm %d", repo->hash_algo->format_id);
 	}
-	refs->write_options.default_permissions = calc_shared_perm(0666 & ~mask);
+	refs->write_options.default_permissions = calc_shared_perm(the_repository, 0666 & ~mask);
 	refs->write_options.disable_auto_compact =
 		!git_env_bool("GIT_TEST_REFTABLE_AUTOCOMPACTION", 1);
 	refs->write_options.lock_timeout_ms = 100;
 	refs->write_options.fsync = reftable_be_fsync;
 
-	git_config(reftable_be_config, &refs->write_options);
+	repo_config(the_repository, reftable_be_config, &refs->write_options);
 
 	/*
 	 * It is somewhat unfortunate that we have to mirror the default block
@@ -470,21 +471,21 @@ static int reftable_be_create_on_disk(struct ref_store *ref_store,
 	struct strbuf sb = STRBUF_INIT;
 
 	strbuf_addf(&sb, "%s/reftable", refs->base.gitdir);
-	safe_create_dir(sb.buf, 1);
+	safe_create_dir(the_repository, sb.buf, 1);
 	strbuf_reset(&sb);
 
 	strbuf_addf(&sb, "%s/HEAD", refs->base.gitdir);
 	write_file(sb.buf, "ref: refs/heads/.invalid");
-	adjust_shared_perm(sb.buf);
+	adjust_shared_perm(the_repository, sb.buf);
 	strbuf_reset(&sb);
 
 	strbuf_addf(&sb, "%s/refs", refs->base.gitdir);
-	safe_create_dir(sb.buf, 1);
+	safe_create_dir(the_repository, sb.buf, 1);
 	strbuf_reset(&sb);
 
 	strbuf_addf(&sb, "%s/refs/heads", refs->base.gitdir);
 	write_file(sb.buf, "this repository uses the reftable format");
-	adjust_shared_perm(sb.buf);
+	adjust_shared_perm(the_repository, sb.buf);
 
 	strbuf_release(&sb);
 	return 0;
@@ -547,7 +548,7 @@ struct reftable_ref_iterator {
 	struct reftable_ref_record ref;
 	struct object_id oid;
 
-	const char *prefix;
+	char *prefix;
 	size_t prefix_len;
 	char **exclude_patterns;
 	size_t exclude_patterns_index;
@@ -711,18 +712,30 @@ static int reftable_ref_iterator_advance(struct ref_iterator *ref_iterator)
 		break;
 	}
 
-	if (iter->err > 0) {
-		if (ref_iterator_abort(ref_iterator) != ITER_DONE)
-			return ITER_ERROR;
+	if (iter->err > 0)
 		return ITER_DONE;
-	}
-
-	if (iter->err < 0) {
-		ref_iterator_abort(ref_iterator);
+	if (iter->err < 0)
 		return ITER_ERROR;
-	}
-
 	return ITER_OK;
+}
+
+static int reftable_ref_iterator_seek(struct ref_iterator *ref_iterator,
+				      const char *refname, unsigned int flags)
+{
+	struct reftable_ref_iterator *iter =
+		(struct reftable_ref_iterator *)ref_iterator;
+
+	/* Unset any previously set prefix */
+	FREE_AND_NULL(iter->prefix);
+	iter->prefix_len = 0;
+
+	if (flags & REF_ITERATOR_SEEK_SET_PREFIX) {
+		iter->prefix = xstrdup_or_null(refname);
+		iter->prefix_len = refname ? strlen(refname) : 0;
+	}
+	iter->err = reftable_iterator_seek_ref(&iter->iter, refname);
+
+	return iter->err;
 }
 
 static int reftable_ref_iterator_peel(struct ref_iterator *ref_iterator,
@@ -740,7 +753,7 @@ static int reftable_ref_iterator_peel(struct ref_iterator *ref_iterator,
 	return -1;
 }
 
-static int reftable_ref_iterator_abort(struct ref_iterator *ref_iterator)
+static void reftable_ref_iterator_release(struct ref_iterator *ref_iterator)
 {
 	struct reftable_ref_iterator *iter =
 		(struct reftable_ref_iterator *)ref_iterator;
@@ -751,14 +764,14 @@ static int reftable_ref_iterator_abort(struct ref_iterator *ref_iterator)
 			free(iter->exclude_patterns[i]);
 		free(iter->exclude_patterns);
 	}
-	free(iter);
-	return ITER_DONE;
+	free(iter->prefix);
 }
 
 static struct ref_iterator_vtable reftable_ref_iterator_vtable = {
 	.advance = reftable_ref_iterator_advance,
+	.seek = reftable_ref_iterator_seek,
 	.peel = reftable_ref_iterator_peel,
-	.abort = reftable_ref_iterator_abort
+	.release = reftable_ref_iterator_release,
 };
 
 static int qsort_strcmp(const void *va, const void *vb)
@@ -815,8 +828,6 @@ static struct reftable_ref_iterator *ref_iterator_for_stack(struct reftable_ref_
 
 	iter = xcalloc(1, sizeof(*iter));
 	base_ref_iterator_init(&iter->base, &reftable_ref_iterator_vtable);
-	iter->prefix = prefix;
-	iter->prefix_len = prefix ? strlen(prefix) : 0;
 	iter->base.oid = &iter->oid;
 	iter->flags = flags;
 	iter->refs = refs;
@@ -830,8 +841,12 @@ static struct reftable_ref_iterator *ref_iterator_for_stack(struct reftable_ref_
 	if (ret)
 		goto done;
 
-	reftable_stack_init_ref_iterator(stack, &iter->iter);
-	ret = reftable_iterator_seek_ref(&iter->iter, prefix);
+	ret = reftable_stack_init_ref_iterator(stack, &iter->iter);
+	if (ret)
+		goto done;
+
+	ret = reftable_ref_iterator_seek(&iter->base, prefix,
+					 REF_ITERATOR_SEEK_SET_PREFIX);
 	if (ret)
 		goto done;
 
@@ -920,8 +935,12 @@ static int reftable_be_read_symbolic_ref(struct ref_store *ref_store,
 		return ret;
 
 	ret = reftable_backend_read_ref(be, refname, &oid, referent, &type);
-	if (type != REF_ISSYMREF)
+	if (ret)
 		ret = -1;
+	else if (type == REF_ISSYMREF)
+		; /* happy */
+	else
+		ret = NOT_A_SYMREF;
 	return ret;
 }
 
@@ -938,6 +957,7 @@ struct write_transaction_table_arg {
 	size_t updates_nr;
 	size_t updates_alloc;
 	size_t updates_expected;
+	uint64_t max_index;
 };
 
 struct reftable_transaction_data {
@@ -993,10 +1013,6 @@ static int prepare_transaction_update(struct write_transaction_table_arg **out,
 	if (!arg) {
 		struct reftable_addition *addition;
 
-		ret = reftable_stack_reload(be->stack);
-		if (ret)
-			return ret;
-
 		ret = reftable_stack_new_addition(&addition, be->stack,
 						  REFTABLE_STACK_NEW_ADDITION_RELOAD);
 		if (ret) {
@@ -1015,6 +1031,7 @@ static int prepare_transaction_update(struct write_transaction_table_arg **out,
 		arg->updates_nr = 0;
 		arg->updates_alloc = 0;
 		arg->updates_expected = 0;
+		arg->max_index = 0;
 	}
 
 	arg->updates_expected++;
@@ -1055,6 +1072,276 @@ static int queue_transaction_update(struct reftable_ref_store *refs,
 	return 0;
 }
 
+static enum ref_transaction_error prepare_single_update(struct reftable_ref_store *refs,
+							struct reftable_transaction_data *tx_data,
+							struct ref_transaction *transaction,
+							struct reftable_backend *be,
+							struct ref_update *u,
+							size_t update_idx,
+							struct string_list *refnames_to_check,
+							unsigned int head_type,
+							struct strbuf *head_referent,
+							struct strbuf *referent,
+							struct strbuf *err)
+{
+	enum ref_transaction_error ret = 0;
+	struct object_id current_oid = {0};
+	const char *rewritten_ref;
+
+	/*
+	 * There is no need to reload the respective backends here as
+	 * we have already reloaded them when preparing the transaction
+	 * update. And given that the stacks have been locked there
+	 * shouldn't have been any concurrent modifications of the
+	 * stack.
+	 */
+	ret = backend_for(&be, refs, u->refname, &rewritten_ref, 0);
+	if (ret)
+		return REF_TRANSACTION_ERROR_GENERIC;
+
+	if (u->flags & REF_LOG_USE_PROVIDED_OIDS) {
+		if (!(u->flags & REF_HAVE_OLD) ||
+		    !(u->flags & REF_HAVE_NEW) ||
+		    !(u->flags & REF_LOG_ONLY)) {
+			strbuf_addf(err, _("trying to write reflog for '%s' "
+					   "with incomplete values"), u->refname);
+			return REF_TRANSACTION_ERROR_GENERIC;
+		}
+
+		if (queue_transaction_update(refs, tx_data, u, &u->old_oid, err))
+			return REF_TRANSACTION_ERROR_GENERIC;
+		return 0;
+	}
+
+	/* Verify that the new object ID is valid. */
+	if ((u->flags & REF_HAVE_NEW) && !is_null_oid(&u->new_oid) &&
+	    !(u->flags & REF_SKIP_OID_VERIFICATION) &&
+	    !(u->flags & REF_LOG_ONLY)) {
+		struct object *o = parse_object(refs->base.repo, &u->new_oid);
+		if (!o) {
+			strbuf_addf(err,
+				    _("trying to write ref '%s' with nonexistent object %s"),
+				    u->refname, oid_to_hex(&u->new_oid));
+			return REF_TRANSACTION_ERROR_INVALID_NEW_VALUE;
+		}
+
+		if (o->type != OBJ_COMMIT && is_branch(u->refname)) {
+			strbuf_addf(err, _("trying to write non-commit object %s to branch '%s'"),
+				    oid_to_hex(&u->new_oid), u->refname);
+			return REF_TRANSACTION_ERROR_INVALID_NEW_VALUE;
+		}
+	}
+
+	/*
+	 * When we update the reference that HEAD points to we enqueue
+	 * a second log-only update for HEAD so that its reflog is
+	 * updated accordingly.
+	 */
+	if (head_type == REF_ISSYMREF &&
+	    !(u->flags & REF_LOG_ONLY) &&
+	    !(u->flags & REF_UPDATE_VIA_HEAD) &&
+	    !strcmp(rewritten_ref, head_referent->buf)) {
+		/*
+		 * First make sure that HEAD is not already in the
+		 * transaction. This check is O(lg N) in the transaction
+		 * size, but it happens at most once per transaction.
+		 */
+		if (string_list_has_string(&transaction->refnames, "HEAD")) {
+			/* An entry already existed */
+			strbuf_addf(err,
+				    _("multiple updates for 'HEAD' (including one "
+				      "via its referent '%s') are not allowed"),
+				    u->refname);
+			return REF_TRANSACTION_ERROR_NAME_CONFLICT;
+		}
+
+		ref_transaction_add_update(
+			transaction, "HEAD",
+			u->flags | REF_LOG_ONLY | REF_NO_DEREF,
+			&u->new_oid, &u->old_oid, NULL, NULL, NULL,
+			u->msg);
+	}
+
+	ret = reftable_backend_read_ref(be, rewritten_ref,
+					&current_oid, referent, &u->type);
+	if (ret < 0)
+		return REF_TRANSACTION_ERROR_GENERIC;
+	if (ret > 0 && !ref_update_expects_existing_old_ref(u)) {
+		struct string_list_item *item;
+		/*
+		 * The reference does not exist, and we either have no
+		 * old object ID or expect the reference to not exist.
+		 * We can thus skip below safety checks as well as the
+		 * symref splitting. But we do want to verify that
+		 * there is no conflicting reference here so that we
+		 * can output a proper error message instead of failing
+		 * at a later point.
+		 */
+		item = string_list_append(refnames_to_check, u->refname);
+		item->util = xmalloc(sizeof(update_idx));
+		memcpy(item->util, &update_idx, sizeof(update_idx));
+
+		/*
+		 * There is no need to write the reference deletion
+		 * when the reference in question doesn't exist.
+		 */
+		if ((u->flags & REF_HAVE_NEW) && !ref_update_has_null_new_value(u)) {
+			ret = queue_transaction_update(refs, tx_data, u,
+						       &current_oid, err);
+			if (ret)
+				return REF_TRANSACTION_ERROR_GENERIC;
+		}
+
+		return 0;
+	}
+	if (ret > 0) {
+		/* The reference does not exist, but we expected it to. */
+		strbuf_addf(err, _("cannot lock ref '%s': "
+				   "unable to resolve reference '%s'"),
+			    ref_update_original_update_refname(u), u->refname);
+		return REF_TRANSACTION_ERROR_NONEXISTENT_REF;
+	}
+
+	if (u->type & REF_ISSYMREF) {
+		/*
+		 * The reftable stack is locked at this point already,
+		 * so it is safe to call `refs_resolve_ref_unsafe()`
+		 * here without causing races.
+		 */
+		const char *resolved = refs_resolve_ref_unsafe(&refs->base, u->refname, 0,
+							       &current_oid, NULL);
+
+		if (u->flags & REF_NO_DEREF) {
+			if (u->flags & REF_HAVE_OLD && !resolved) {
+				strbuf_addf(err, _("cannot lock ref '%s': "
+						   "error reading reference"), u->refname);
+				return REF_TRANSACTION_ERROR_GENERIC;
+			}
+		} else {
+			struct ref_update *new_update;
+			int new_flags;
+
+			new_flags = u->flags;
+			if (!strcmp(rewritten_ref, "HEAD"))
+				new_flags |= REF_UPDATE_VIA_HEAD;
+
+			if (string_list_has_string(&transaction->refnames, referent->buf)) {
+				strbuf_addf(err,
+					    _("multiple updates for '%s' (including one "
+					      "via symref '%s') are not allowed"),
+					    referent->buf, u->refname);
+				return REF_TRANSACTION_ERROR_NAME_CONFLICT;
+			}
+
+			/*
+			 * If we are updating a symref (eg. HEAD), we should also
+			 * update the branch that the symref points to.
+			 *
+			 * This is generic functionality, and would be better
+			 * done in refs.c, but the current implementation is
+			 * intertwined with the locking in files-backend.c.
+			 */
+			new_update = ref_transaction_add_update(
+				transaction, referent->buf, new_flags,
+				u->new_target ? NULL : &u->new_oid,
+				u->old_target ? NULL : &u->old_oid,
+				u->new_target, u->old_target,
+				u->committer_info, u->msg);
+
+			new_update->parent_update = u;
+
+			/* Change the symbolic ref update to log only. */
+			u->flags |= REF_LOG_ONLY | REF_NO_DEREF;
+		}
+	}
+
+	/*
+	 * Verify that the old object matches our expectations. Note
+	 * that the error messages here do not make a lot of sense in
+	 * the context of the reftable backend as we never lock
+	 * individual refs. But the error messages match what the files
+	 * backend returns, which keeps our tests happy.
+	 */
+	if (u->old_target) {
+		if (!(u->type & REF_ISSYMREF)) {
+			strbuf_addf(err, _("cannot lock ref '%s': "
+					   "expected symref with target '%s': "
+					   "but is a regular ref"),
+				    ref_update_original_update_refname(u),
+				    u->old_target);
+			return REF_TRANSACTION_ERROR_EXPECTED_SYMREF;
+		}
+
+		ret = ref_update_check_old_target(referent->buf, u, err);
+		if (ret)
+			return ret;
+	} else if ((u->flags & (REF_LOG_ONLY | REF_HAVE_OLD)) == REF_HAVE_OLD) {
+		if (oideq(&current_oid, &u->old_oid)) {
+			/*
+			 * Normally matching the expected old oid is enough. Either we
+			 * found the ref at the expected state, or we are creating and
+			 * expect the null oid (and likewise found nothing).
+			 *
+			 * But there is one exception for the null oid: if we found a
+			 * symref pointing to nothing we'll also get the null oid. In
+			 * regular recursive mode, that's good (we'll write to what the
+			 * symref points to, which doesn't exist). But in no-deref
+			 * mode, it means we'll clobber the symref, even though the
+			 * caller asked for this to be a creation event. So flag
+			 * that case to preserve the dangling symref.
+			 *
+			 * Everything else is OK and we can fall through to the
+			 * end of the conditional chain.
+			 */
+			if ((u->flags & REF_NO_DEREF) &&
+			    referent->len &&
+			    is_null_oid(&u->old_oid)) {
+				strbuf_addf(err, _("cannot lock ref '%s': "
+					    "dangling symref already exists"),
+					    ref_update_original_update_refname(u));
+				return REF_TRANSACTION_ERROR_CREATE_EXISTS;
+			}
+		} else if (is_null_oid(&u->old_oid)) {
+			strbuf_addf(err, _("cannot lock ref '%s': "
+					   "reference already exists"),
+				    ref_update_original_update_refname(u));
+			return REF_TRANSACTION_ERROR_CREATE_EXISTS;
+		} else if (is_null_oid(&current_oid)) {
+			strbuf_addf(err, _("cannot lock ref '%s': "
+					   "reference is missing but expected %s"),
+				    ref_update_original_update_refname(u),
+				    oid_to_hex(&u->old_oid));
+			return REF_TRANSACTION_ERROR_NONEXISTENT_REF;
+		} else {
+			strbuf_addf(err, _("cannot lock ref '%s': "
+					   "is at %s but expected %s"),
+				    ref_update_original_update_refname(u),
+				    oid_to_hex(&current_oid),
+				    oid_to_hex(&u->old_oid));
+			return REF_TRANSACTION_ERROR_INCORRECT_OLD_VALUE;
+		}
+	}
+
+	/*
+	 * If all of the following conditions are true:
+	 *
+	 *   - We're not about to write a symref.
+	 *   - We're not about to write a log-only entry.
+	 *   - Old and new object ID are different.
+	 *
+	 * Then we're essentially doing a no-op update that can be
+	 * skipped. This is not only for the sake of efficiency, but
+	 * also skips writing unneeded reflog entries.
+	 */
+	if ((u->type & REF_ISSYMREF) ||
+	    (u->flags & REF_LOG_ONLY) ||
+	    (u->flags & REF_HAVE_NEW && !oideq(&current_oid, &u->new_oid)))
+		if (queue_transaction_update(refs, tx_data, u, &current_oid, err))
+			return REF_TRANSACTION_ERROR_GENERIC;
+
+	return 0;
+}
+
 static int reftable_be_transaction_prepare(struct ref_store *ref_store,
 					   struct ref_transaction *transaction,
 					   struct strbuf *err)
@@ -1062,7 +1349,7 @@ static int reftable_be_transaction_prepare(struct ref_store *ref_store,
 	struct reftable_ref_store *refs =
 		reftable_be_downcast(ref_store, REF_STORE_WRITE|REF_STORE_MAIN, "ref_transaction_prepare");
 	struct strbuf referent = STRBUF_INIT, head_referent = STRBUF_INIT;
-	struct string_list affected_refnames = STRING_LIST_INIT_NODUP;
+	struct string_list refnames_to_check = STRING_LIST_INIT_NODUP;
 	struct reftable_transaction_data *tx_data = NULL;
 	struct reftable_backend *be;
 	struct object_id head_oid;
@@ -1086,9 +1373,6 @@ static int reftable_be_transaction_prepare(struct ref_store *ref_store,
 						 transaction->updates[i], err);
 		if (ret)
 			goto done;
-
-		string_list_append(&affected_refnames,
-				   transaction->updates[i]->refname);
 	}
 
 	/*
@@ -1098,17 +1382,6 @@ static int reftable_be_transaction_prepare(struct ref_store *ref_store,
 	for (i = 0; i < tx_data->args_nr; i++) {
 		CALLOC_ARRAY(tx_data->args[i].updates, tx_data->args[i].updates_expected);
 		tx_data->args[i].updates_alloc = tx_data->args[i].updates_expected;
-	}
-
-	/*
-	 * Fail if a refname appears more than once in the transaction.
-	 * This code is taken from the files backend and is a good candidate to
-	 * be moved into the generic layer.
-	 */
-	string_list_sort(&affected_refnames);
-	if (ref_update_reject_duplicates(&affected_refnames, err)) {
-		ret = TRANSACTION_GENERIC_ERROR;
-		goto done;
 	}
 
 	/*
@@ -1133,246 +1406,33 @@ static int reftable_be_transaction_prepare(struct ref_store *ref_store,
 	ret = 0;
 
 	for (i = 0; i < transaction->nr; i++) {
-		struct ref_update *u = transaction->updates[i];
-		struct object_id current_oid = {0};
-		const char *rewritten_ref;
+		ret = prepare_single_update(refs, tx_data, transaction, be,
+					    transaction->updates[i], i,
+					    &refnames_to_check, head_type,
+					    &head_referent, &referent, err);
+		if (ret) {
+			if (ref_transaction_maybe_set_rejected(transaction, i, ret)) {
+				strbuf_reset(err);
+				ret = 0;
 
-		/*
-		 * There is no need to reload the respective backends here as
-		 * we have already reloaded them when preparing the transaction
-		 * update. And given that the stacks have been locked there
-		 * shouldn't have been any concurrent modifications of the
-		 * stack.
-		 */
-		ret = backend_for(&be, refs, u->refname, &rewritten_ref, 0);
-		if (ret)
+				continue;
+			}
 			goto done;
-
-		/* Verify that the new object ID is valid. */
-		if ((u->flags & REF_HAVE_NEW) && !is_null_oid(&u->new_oid) &&
-		    !(u->flags & REF_SKIP_OID_VERIFICATION) &&
-		    !(u->flags & REF_LOG_ONLY)) {
-			struct object *o = parse_object(refs->base.repo, &u->new_oid);
-			if (!o) {
-				strbuf_addf(err,
-					    _("trying to write ref '%s' with nonexistent object %s"),
-					    u->refname, oid_to_hex(&u->new_oid));
-				ret = -1;
-				goto done;
-			}
-
-			if (o->type != OBJ_COMMIT && is_branch(u->refname)) {
-				strbuf_addf(err, _("trying to write non-commit object %s to branch '%s'"),
-					    oid_to_hex(&u->new_oid), u->refname);
-				ret = -1;
-				goto done;
-			}
-		}
-
-		/*
-		 * When we update the reference that HEAD points to we enqueue
-		 * a second log-only update for HEAD so that its reflog is
-		 * updated accordingly.
-		 */
-		if (head_type == REF_ISSYMREF &&
-		    !(u->flags & REF_LOG_ONLY) &&
-		    !(u->flags & REF_UPDATE_VIA_HEAD) &&
-		    !strcmp(rewritten_ref, head_referent.buf)) {
-			struct ref_update *new_update;
-
-			/*
-			 * First make sure that HEAD is not already in the
-			 * transaction. This check is O(lg N) in the transaction
-			 * size, but it happens at most once per transaction.
-			 */
-			if (string_list_has_string(&affected_refnames, "HEAD")) {
-				/* An entry already existed */
-				strbuf_addf(err,
-					    _("multiple updates for 'HEAD' (including one "
-					    "via its referent '%s') are not allowed"),
-					    u->refname);
-				ret = TRANSACTION_NAME_CONFLICT;
-				goto done;
-			}
-
-			new_update = ref_transaction_add_update(
-					transaction, "HEAD",
-					u->flags | REF_LOG_ONLY | REF_NO_DEREF,
-					&u->new_oid, &u->old_oid, NULL, NULL, u->msg);
-			string_list_insert(&affected_refnames, new_update->refname);
-		}
-
-		ret = reftable_backend_read_ref(be, rewritten_ref,
-						&current_oid, &referent, &u->type);
-		if (ret < 0)
-			goto done;
-		if (ret > 0 && !ref_update_expects_existing_old_ref(u)) {
-			/*
-			 * The reference does not exist, and we either have no
-			 * old object ID or expect the reference to not exist.
-			 * We can thus skip below safety checks as well as the
-			 * symref splitting. But we do want to verify that
-			 * there is no conflicting reference here so that we
-			 * can output a proper error message instead of failing
-			 * at a later point.
-			 */
-			ret = refs_verify_refname_available(ref_store, u->refname,
-							    &affected_refnames, NULL,
-							    transaction->flags & REF_TRANSACTION_FLAG_INITIAL,
-							    err);
-			if (ret < 0)
-				goto done;
-
-			/*
-			 * There is no need to write the reference deletion
-			 * when the reference in question doesn't exist.
-			 */
-			 if ((u->flags & REF_HAVE_NEW) && !ref_update_has_null_new_value(u)) {
-				 ret = queue_transaction_update(refs, tx_data, u,
-								&current_oid, err);
-				 if (ret)
-					 goto done;
-			 }
-
-			continue;
-		}
-		if (ret > 0) {
-			/* The reference does not exist, but we expected it to. */
-			strbuf_addf(err, _("cannot lock ref '%s': "
-				    "unable to resolve reference '%s'"),
-				    ref_update_original_update_refname(u), u->refname);
-			ret = -1;
-			goto done;
-		}
-
-		if (u->type & REF_ISSYMREF) {
-			/*
-			 * The reftable stack is locked at this point already,
-			 * so it is safe to call `refs_resolve_ref_unsafe()`
-			 * here without causing races.
-			 */
-			const char *resolved = refs_resolve_ref_unsafe(&refs->base, u->refname, 0,
-								       &current_oid, NULL);
-
-			if (u->flags & REF_NO_DEREF) {
-				if (u->flags & REF_HAVE_OLD && !resolved) {
-					strbuf_addf(err, _("cannot lock ref '%s': "
-						    "error reading reference"), u->refname);
-					ret = -1;
-					goto done;
-				}
-			} else {
-				struct ref_update *new_update;
-				int new_flags;
-
-				new_flags = u->flags;
-				if (!strcmp(rewritten_ref, "HEAD"))
-					new_flags |= REF_UPDATE_VIA_HEAD;
-
-				/*
-				 * If we are updating a symref (eg. HEAD), we should also
-				 * update the branch that the symref points to.
-				 *
-				 * This is generic functionality, and would be better
-				 * done in refs.c, but the current implementation is
-				 * intertwined with the locking in files-backend.c.
-				 */
-				new_update = ref_transaction_add_update(
-					transaction, referent.buf, new_flags,
-					u->new_target ? NULL : &u->new_oid,
-					u->old_target ? NULL : &u->old_oid,
-					u->new_target, u->old_target, u->msg);
-
-				new_update->parent_update = u;
-
-				/*
-				 * Change the symbolic ref update to log only. Also, it
-				 * doesn't need to check its old OID value, as that will be
-				 * done when new_update is processed.
-				 */
-				u->flags |= REF_LOG_ONLY | REF_NO_DEREF;
-				u->flags &= ~REF_HAVE_OLD;
-
-				if (string_list_has_string(&affected_refnames, new_update->refname)) {
-					strbuf_addf(err,
-						    _("multiple updates for '%s' (including one "
-						    "via symref '%s') are not allowed"),
-						    referent.buf, u->refname);
-					ret = TRANSACTION_NAME_CONFLICT;
-					goto done;
-				}
-				string_list_insert(&affected_refnames, new_update->refname);
-			}
-		}
-
-		/*
-		 * Verify that the old object matches our expectations. Note
-		 * that the error messages here do not make a lot of sense in
-		 * the context of the reftable backend as we never lock
-		 * individual refs. But the error messages match what the files
-		 * backend returns, which keeps our tests happy.
-		 */
-		if (u->old_target) {
-			if (!(u->type & REF_ISSYMREF)) {
-				strbuf_addf(err, _("cannot lock ref '%s': "
-					   "expected symref with target '%s': "
-					   "but is a regular ref"),
-					    ref_update_original_update_refname(u),
-					    u->old_target);
-				ret = -1;
-				goto done;
-			}
-
-			if (ref_update_check_old_target(referent.buf, u, err)) {
-				ret = -1;
-				goto done;
-			}
-		} else if ((u->flags & REF_HAVE_OLD) && !oideq(&current_oid, &u->old_oid)) {
-			if (is_null_oid(&u->old_oid))
-				strbuf_addf(err, _("cannot lock ref '%s': "
-						   "reference already exists"),
-					    ref_update_original_update_refname(u));
-			else if (is_null_oid(&current_oid))
-				strbuf_addf(err, _("cannot lock ref '%s': "
-						   "reference is missing but expected %s"),
-					    ref_update_original_update_refname(u),
-					    oid_to_hex(&u->old_oid));
-			else
-				strbuf_addf(err, _("cannot lock ref '%s': "
-						   "is at %s but expected %s"),
-					    ref_update_original_update_refname(u),
-					    oid_to_hex(&current_oid),
-					    oid_to_hex(&u->old_oid));
-			ret = -1;
-			goto done;
-		}
-
-		/*
-		 * If all of the following conditions are true:
-		 *
-		 *   - We're not about to write a symref.
-		 *   - We're not about to write a log-only entry.
-		 *   - Old and new object ID are different.
-		 *
-		 * Then we're essentially doing a no-op update that can be
-		 * skipped. This is not only for the sake of efficiency, but
-		 * also skips writing unneeded reflog entries.
-		 */
-		if ((u->type & REF_ISSYMREF) ||
-		    (u->flags & REF_LOG_ONLY) ||
-		    (u->flags & REF_HAVE_NEW && !oideq(&current_oid, &u->new_oid))) {
-			ret = queue_transaction_update(refs, tx_data, u,
-						       &current_oid, err);
-			if (ret)
-				goto done;
 		}
 	}
+
+	ret = refs_verify_refnames_available(ref_store, &refnames_to_check,
+					     &transaction->refnames, NULL,
+					     transaction,
+					     transaction->flags & REF_TRANSACTION_FLAG_INITIAL,
+					     err);
+	if (ret < 0)
+		goto done;
 
 	transaction->backend_data = tx_data;
 	transaction->state = REF_TRANSACTION_PREPARED;
 
 done:
-	assert(ret != REFTABLE_API_ERROR);
 	if (ret < 0) {
 		free_transaction_data(tx_data);
 		transaction->state = REF_TRANSACTION_CLOSED;
@@ -1380,9 +1440,9 @@ done:
 			strbuf_addf(err, _("reftable: transaction prepare: %s"),
 				    reftable_error_str(ret));
 	}
-	string_list_clear(&affected_refnames, 0);
 	strbuf_release(&referent);
 	strbuf_release(&head_referent);
+	string_list_clear(&refnames_to_check, 1);
 
 	return ret;
 }
@@ -1399,8 +1459,17 @@ static int reftable_be_transaction_abort(struct ref_store *ref_store UNUSED,
 
 static int transaction_update_cmp(const void *a, const void *b)
 {
-	return strcmp(((struct reftable_transaction_update *)a)->update->refname,
-		      ((struct reftable_transaction_update *)b)->update->refname);
+	struct reftable_transaction_update *update_a = (struct reftable_transaction_update *)a;
+	struct reftable_transaction_update *update_b = (struct reftable_transaction_update *)b;
+
+	/*
+	 * If there is an index set, it should take preference (default is 0).
+	 * This ensures that updates with indexes are sorted amongst themselves.
+	 */
+	if (update_a->update->index || update_b->update->index)
+		return update_a->update->index - update_b->update->index;
+
+	return strcmp(update_a->update->refname, update_b->update->refname);
 }
 
 static int write_transaction_table(struct reftable_writer *writer, void *cb_data)
@@ -1419,11 +1488,21 @@ static int write_transaction_table(struct reftable_writer *writer, void *cb_data
 
 	QSORT(arg->updates, arg->updates_nr, transaction_update_cmp);
 
-	reftable_writer_set_limits(writer, ts, ts);
+	/*
+	 * During reflog migration, we add indexes for a single reflog with
+	 * multiple entries. Each entry will contain a different update_index,
+	 * so set the limits accordingly.
+	 */
+	ret = reftable_writer_set_limits(writer, ts, ts + arg->max_index);
+	if (ret < 0)
+		goto done;
 
 	for (i = 0; i < arg->updates_nr; i++) {
 		struct reftable_transaction_update *tx_update = &arg->updates[i];
 		struct ref_update *u = tx_update->update;
+
+		if (u->rejection_err)
+			continue;
 
 		/*
 		 * Write a reflog entry when updating a ref to point to
@@ -1499,12 +1578,28 @@ static int write_transaction_table(struct reftable_writer *writer, void *cb_data
 			}
 
 			if (create_reflog) {
+				struct ident_split c;
+
 				ALLOC_GROW(logs, logs_nr + 1, logs_alloc);
 				log = &logs[logs_nr++];
 				memset(log, 0, sizeof(*log));
 
-				fill_reftable_log_record(log, &committer_ident);
-				log->update_index = ts;
+				if (u->committer_info) {
+					if (split_ident_line(&c, u->committer_info,
+							     strlen(u->committer_info)))
+						BUG("failed splitting committer info");
+				} else {
+					c = committer_ident;
+				}
+
+				fill_reftable_log_record(log, &c);
+
+				/*
+				 * Updates are sorted by the writer. So updates for the same
+				 * refname need to contain different update indices.
+				 */
+				log->update_index = ts + u->index;
+
 				log->refname = xstrdup(u->refname);
 				memcpy(log->value.update.new_hash,
 				       u->new_oid.hash, GIT_MAX_RAWSZ);
@@ -1589,6 +1684,8 @@ static int reftable_be_transaction_finish(struct ref_store *ref_store UNUSED,
 	int ret = 0;
 
 	for (size_t i = 0; i < tx_data->args_nr; i++) {
+		tx_data->args[i].max_index = transaction->max_index;
+
 		ret = reftable_addition_add(tx_data->args[i].addition,
 					    write_transaction_table, &tx_data->args[i]);
 		if (ret < 0)
@@ -1643,6 +1740,12 @@ static int reftable_be_pack_refs(struct ref_store *ref_store,
 
 out:
 	return ret;
+}
+
+static int reftable_be_optimize(struct ref_store *ref_store,
+				struct pack_refs_opts *opts)
+{
+	return reftable_be_pack_refs(ref_store, opts);
 }
 
 struct write_create_symref_arg {
@@ -1723,7 +1826,9 @@ static int write_copy_table(struct reftable_writer *writer, void *cb_data)
 	deletion_ts = creation_ts = reftable_stack_next_update_index(arg->be->stack);
 	if (arg->delete_old)
 		creation_ts++;
-	reftable_writer_set_limits(writer, deletion_ts, creation_ts);
+	ret = reftable_writer_set_limits(writer, deletion_ts, creation_ts);
+	if (ret < 0)
+		goto done;
 
 	/*
 	 * Add the new reference. If this is a rename then we also delete the
@@ -1896,7 +2001,8 @@ static int reftable_be_rename_ref(struct ref_store *ref_store,
 	ret = backend_for(&arg.be, refs, newrefname, &newrefname, 1);
 	if (ret)
 		goto done;
-	ret = reftable_stack_add(arg.be->stack, &write_copy_table, &arg);
+	ret = reftable_stack_add(arg.be->stack, &write_copy_table, &arg,
+				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
 
 done:
 	assert(ret != REFTABLE_API_ERROR);
@@ -1925,7 +2031,8 @@ static int reftable_be_copy_ref(struct ref_store *ref_store,
 	ret = backend_for(&arg.be, refs, newrefname, &newrefname, 1);
 	if (ret)
 		goto done;
-	ret = reftable_stack_add(arg.be->stack, &write_copy_table, &arg);
+	ret = reftable_stack_add(arg.be->stack, &write_copy_table, &arg,
+				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
 
 done:
 	assert(ret != REFTABLE_API_ERROR);
@@ -1970,18 +2077,19 @@ static int reftable_reflog_iterator_advance(struct ref_iterator *ref_iterator)
 		break;
 	}
 
-	if (iter->err > 0) {
-		if (ref_iterator_abort(ref_iterator) != ITER_DONE)
-			return ITER_ERROR;
+	if (iter->err > 0)
 		return ITER_DONE;
-	}
-
-	if (iter->err < 0) {
-		ref_iterator_abort(ref_iterator);
+	if (iter->err < 0)
 		return ITER_ERROR;
-	}
-
 	return ITER_OK;
+}
+
+static int reftable_reflog_iterator_seek(struct ref_iterator *ref_iterator UNUSED,
+					 const char *refname UNUSED,
+					 unsigned int flags UNUSED)
+{
+	BUG("reftable reflog iterator cannot be seeked");
+	return -1;
 }
 
 static int reftable_reflog_iterator_peel(struct ref_iterator *ref_iterator UNUSED,
@@ -1991,21 +2099,20 @@ static int reftable_reflog_iterator_peel(struct ref_iterator *ref_iterator UNUSE
 	return -1;
 }
 
-static int reftable_reflog_iterator_abort(struct ref_iterator *ref_iterator)
+static void reftable_reflog_iterator_release(struct ref_iterator *ref_iterator)
 {
 	struct reftable_reflog_iterator *iter =
 		(struct reftable_reflog_iterator *)ref_iterator;
 	reftable_log_record_release(&iter->log);
 	reftable_iterator_destroy(&iter->iter);
 	strbuf_release(&iter->last_name);
-	free(iter);
-	return ITER_DONE;
 }
 
 static struct ref_iterator_vtable reftable_reflog_iterator_vtable = {
 	.advance = reftable_reflog_iterator_advance,
+	.seek = reftable_reflog_iterator_seek,
 	.peel = reftable_reflog_iterator_peel,
-	.abort = reftable_reflog_iterator_abort
+	.release = reftable_reflog_iterator_release,
 };
 
 static struct reftable_reflog_iterator *reflog_iterator_for_stack(struct reftable_ref_store *refs,
@@ -2077,7 +2184,7 @@ static int yield_log_record(struct reftable_ref_store *refs,
 
 	full_committer = fmt_ident(log->value.update.name, log->value.update.email,
 				   WANT_COMMITTER_IDENT, NULL, IDENT_NO_DATE);
-	return fn(&old_oid, &new_oid, full_committer,
+	return fn(log->refname, &old_oid, &new_oid, full_committer,
 		  log->value.update.time, log->value.update.tz_offset,
 		  log->value.update.message, cb_data);
 }
@@ -2255,7 +2362,9 @@ static int write_reflog_existence_table(struct reftable_writer *writer,
 	if (ret <= 0)
 		goto done;
 
-	reftable_writer_set_limits(writer, ts, ts);
+	ret = reftable_writer_set_limits(writer, ts, ts);
+	if (ret < 0)
+		goto done;
 
 	/*
 	 * The existence entry has both old and new object ID set to the
@@ -2295,7 +2404,8 @@ static int reftable_be_create_reflog(struct ref_store *ref_store,
 		goto done;
 	arg.stack = be->stack;
 
-	ret = reftable_stack_add(be->stack, &write_reflog_existence_table, &arg);
+	ret = reftable_stack_add(be->stack, &write_reflog_existence_table, &arg,
+				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
 
 done:
 	return ret;
@@ -2314,7 +2424,9 @@ static int write_reflog_delete_table(struct reftable_writer *writer, void *cb_da
 	uint64_t ts = reftable_stack_next_update_index(arg->stack);
 	int ret;
 
-	reftable_writer_set_limits(writer, ts, ts);
+	ret = reftable_writer_set_limits(writer, ts, ts);
+	if (ret < 0)
+		goto out;
 
 	ret = reftable_stack_init_log_iterator(arg->stack, &it);
 	if (ret < 0)
@@ -2364,7 +2476,8 @@ static int reftable_be_delete_reflog(struct ref_store *ref_store,
 		return ret;
 	arg.stack = be->stack;
 
-	ret = reftable_stack_add(be->stack, &write_reflog_delete_table, &arg);
+	ret = reftable_stack_add(be->stack, &write_reflog_delete_table, &arg,
+				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
 
 	assert(ret != REFTABLE_API_ERROR);
 	return ret;
@@ -2391,7 +2504,9 @@ static int write_reflog_expiry_table(struct reftable_writer *writer, void *cb_da
 		if (arg->records[i].value_type == REFTABLE_LOG_UPDATE)
 			live_records++;
 
-	reftable_writer_set_limits(writer, ts, ts);
+	ret = reftable_writer_set_limits(writer, ts, ts);
+	if (ret < 0)
+		return ret;
 
 	if (!is_null_oid(&arg->update_oid)) {
 		struct reftable_ref_record ref = {0};
@@ -2483,15 +2598,16 @@ static int reftable_be_reflog_expire(struct ref_store *ref_store,
 	if (ret < 0)
 		goto done;
 
+	ret = reftable_stack_new_addition(&add, be->stack,
+					  REFTABLE_STACK_NEW_ADDITION_RELOAD);
+	if (ret < 0)
+		goto done;
+
 	ret = reftable_stack_init_log_iterator(be->stack, &it);
 	if (ret < 0)
 		goto done;
 
 	ret = reftable_iterator_seek_log(&it, refname);
-	if (ret < 0)
-		goto done;
-
-	ret = reftable_stack_new_addition(&add, be->stack, 0);
 	if (ret < 0)
 		goto done;
 
@@ -2599,11 +2715,56 @@ done:
 	return ret;
 }
 
-static int reftable_be_fsck(struct ref_store *ref_store UNUSED,
-			    struct fsck_options *o UNUSED,
+static void reftable_fsck_verbose_handler(const char *msg, void *cb_data)
+{
+	struct fsck_options *o = cb_data;
+
+	if (o->verbose)
+		fprintf_ln(stderr, "%s", msg);
+}
+
+static const enum fsck_msg_id fsck_msg_id_map[] = {
+	[REFTABLE_FSCK_ERROR_TABLE_NAME] = FSCK_MSG_BAD_REFTABLE_TABLE_NAME,
+};
+
+static int reftable_fsck_error_handler(struct reftable_fsck_info *info,
+				       void *cb_data)
+{
+	struct fsck_ref_report report = { .path = info->path };
+	struct fsck_options *o = cb_data;
+	enum fsck_msg_id msg_id;
+
+	if (info->error < 0 || info->error >= REFTABLE_FSCK_MAX_VALUE)
+		BUG("unknown fsck error: %d", (int)info->error);
+
+	msg_id = fsck_msg_id_map[info->error];
+
+	if (!msg_id)
+		BUG("fsck_msg_id value missing for reftable error: %d", (int)info->error);
+
+	return fsck_report_ref(o, &report, msg_id, "%s", info->msg);
+}
+
+static int reftable_be_fsck(struct ref_store *ref_store, struct fsck_options *o,
 			    struct worktree *wt UNUSED)
 {
-	return 0;
+	struct reftable_ref_store *refs;
+	struct strmap_entry *entry;
+	struct hashmap_iter iter;
+	int ret = 0;
+
+	refs = reftable_be_downcast(ref_store, REF_STORE_READ, "fsck");
+
+	ret |= reftable_fsck_check(refs->main_backend.stack, reftable_fsck_error_handler,
+				   reftable_fsck_verbose_handler, o);
+
+	strmap_for_each_entry(&refs->worktree_backends, &iter, entry) {
+		struct reftable_backend *b = (struct reftable_backend *)entry->value;
+		ret |= reftable_fsck_check(b->stack, reftable_fsck_error_handler,
+					   reftable_fsck_verbose_handler, o);
+	}
+
+	return ret;
 }
 
 struct ref_storage_be refs_be_reftable = {
@@ -2618,6 +2779,7 @@ struct ref_storage_be refs_be_reftable = {
 	.transaction_abort = reftable_be_transaction_abort,
 
 	.pack_refs = reftable_be_pack_refs,
+	.optimize = reftable_be_optimize,
 	.rename_ref = reftable_be_rename_ref,
 	.copy_ref = reftable_be_copy_ref,
 

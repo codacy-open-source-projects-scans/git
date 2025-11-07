@@ -1,4 +1,5 @@
 #define USE_THE_REPOSITORY_VARIABLE
+#define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
 #include "abspath.h"
@@ -58,10 +59,33 @@ static void add_head_info(struct worktree *wt)
 static int is_current_worktree(struct worktree *wt)
 {
 	char *git_dir = absolute_pathdup(repo_get_git_dir(the_repository));
-	const char *wt_git_dir = get_worktree_git_dir(wt);
+	char *wt_git_dir = get_worktree_git_dir(wt);
 	int is_current = !fspathcmp(git_dir, absolute_path(wt_git_dir));
+	free(wt_git_dir);
 	free(git_dir);
 	return is_current;
+}
+
+/*
+* When in a secondary worktree, and when extensions.worktreeConfig
+* is true, only $commondir/config and $commondir/worktrees/<id>/
+* config.worktree are consulted, hence any core.bare=true setting in
+* $commondir/config.worktree gets overlooked. Thus, check it manually
+* to determine if the repository is bare.
+*/
+static int is_main_worktree_bare(struct repository *repo)
+{
+	int bare = 0;
+	struct config_set cs = {0};
+	char *worktree_config = xstrfmt("%s/config.worktree", repo_get_common_dir(repo));
+
+	git_configset_init(&cs);
+	git_configset_add_file(&cs, worktree_config);
+	git_configset_get_bool(&cs, "core.bare", &bare);
+
+	git_configset_clear(&cs);
+	free(worktree_config);
+	return bare;
 }
 
 /**
@@ -78,16 +102,17 @@ static struct worktree *get_main_worktree(int skip_reading_head)
 	CALLOC_ARRAY(worktree, 1);
 	worktree->repo = the_repository;
 	worktree->path = strbuf_detach(&worktree_path, NULL);
-	/*
-	 * NEEDSWORK: If this function is called from a secondary worktree and
-	 * config.worktree is present, is_bare_repository_cfg will reflect the
-	 * contents of config.worktree, not the contents of the main worktree.
-	 * This means that worktree->is_bare may be set to 0 even if the main
-	 * worktree is configured to be bare.
-	 */
-	worktree->is_bare = (is_bare_repository_cfg == 1) ||
-		is_bare_repository();
 	worktree->is_current = is_current_worktree(worktree);
+	worktree->is_bare = (is_bare_repository_cfg == 1) ||
+		is_bare_repository() ||
+		/*
+		 * When in a secondary worktree we have to also verify if the main
+		 * worktree is bare in $commondir/config.worktree.
+		 * This check is unnecessary if we're currently in the main worktree,
+		 * as prior checks already consulted all configs of the current worktree.
+		 */
+		(!worktree->is_current && is_main_worktree_bare(the_repository));
+
 	if (!skip_reading_head)
 		add_head_info(worktree);
 	return worktree;
@@ -103,7 +128,7 @@ struct worktree *get_linked_worktree(const char *id,
 	if (!id)
 		die("Missing linked worktree name");
 
-	strbuf_git_common_path(&path, the_repository, "worktrees/%s/gitdir", id);
+	repo_common_path_append(the_repository, &path, "worktrees/%s/gitdir", id);
 	if (strbuf_read_file(&worktree_path, path.buf, 0) <= 0)
 		/* invalid gitdir file */
 		goto done;
@@ -174,14 +199,19 @@ struct worktree **get_worktrees(void)
 	return get_worktrees_internal(0);
 }
 
-const char *get_worktree_git_dir(const struct worktree *wt)
+struct worktree **get_worktrees_without_reading_head(void)
+{
+	return get_worktrees_internal(1);
+}
+
+char *get_worktree_git_dir(const struct worktree *wt)
 {
 	if (!wt)
-		return repo_get_git_dir(the_repository);
+		return xstrdup(repo_get_git_dir(the_repository));
 	else if (!wt->id)
-		return repo_get_common_dir(the_repository);
+		return xstrdup(repo_get_common_dir(the_repository));
 	else
-		return git_common_path("worktrees/%s", wt->id);
+		return repo_common_path(the_repository, "worktrees/%s", wt->id);
 }
 
 static struct worktree *find_worktree_by_suffix(struct worktree **list,
@@ -312,6 +342,7 @@ int validate_worktree(const struct worktree *wt, struct strbuf *errmsg,
 {
 	struct strbuf wt_path = STRBUF_INIT;
 	struct strbuf realpath = STRBUF_INIT;
+	struct strbuf buf = STRBUF_INIT;
 	char *path = NULL;
 	int err, ret = -1;
 
@@ -341,7 +372,7 @@ int validate_worktree(const struct worktree *wt, struct strbuf *errmsg,
 	if (!is_absolute_path(wt->path)) {
 		strbuf_addf_gently(errmsg,
 				   _("'%s' file does not contain absolute path to the working tree location"),
-				   git_common_path("worktrees/%s/gitdir", wt->id));
+				   repo_common_path_replace(the_repository, &buf, "worktrees/%s/gitdir", wt->id));
 		goto done;
 	}
 
@@ -363,14 +394,16 @@ int validate_worktree(const struct worktree *wt, struct strbuf *errmsg,
 		goto done;
 	}
 
-	strbuf_realpath(&realpath, git_common_path("worktrees/%s", wt->id), 1);
+	strbuf_realpath(&realpath, repo_common_path_replace(the_repository, &buf, "worktrees/%s", wt->id), 1);
 	ret = fspathcmp(path, realpath.buf);
 
 	if (ret)
 		strbuf_addf_gently(errmsg, _("'%s' does not point back to '%s'"),
-				   wt->path, git_common_path("worktrees/%s", wt->id));
+				   wt->path, repo_common_path_replace(the_repository, &buf,
+								      "worktrees/%s", wt->id));
 done:
 	free(path);
+	strbuf_release(&buf);
 	strbuf_release(&wt_path);
 	strbuf_release(&realpath);
 	return ret;
@@ -382,11 +415,13 @@ void update_worktree_location(struct worktree *wt, const char *path_,
 	struct strbuf path = STRBUF_INIT;
 	struct strbuf dotgit = STRBUF_INIT;
 	struct strbuf gitdir = STRBUF_INIT;
+	char *wt_gitdir;
 
 	if (is_main_worktree(wt))
 		BUG("can't relocate main worktree");
 
-	strbuf_realpath(&gitdir, git_common_path("worktrees/%s/gitdir", wt->id), 1);
+	wt_gitdir = repo_common_path(the_repository, "worktrees/%s/gitdir", wt->id);
+	strbuf_realpath(&gitdir, wt_gitdir, 1);
 	strbuf_realpath(&path, path_, 1);
 	strbuf_addf(&dotgit, "%s/.git", path.buf);
 	if (fspathcmp(wt->path, path.buf)) {
@@ -398,6 +433,7 @@ void update_worktree_location(struct worktree *wt, const char *path_,
 	strbuf_release(&path);
 	strbuf_release(&dotgit);
 	strbuf_release(&gitdir);
+	free(wt_gitdir);
 }
 
 int is_worktree_being_rebased(const struct worktree *wt,
@@ -486,7 +522,8 @@ int submodule_uses_worktrees(const char *path)
 	int ret = 0;
 	struct repository_format format = REPOSITORY_FORMAT_INIT;
 
-	submodule_gitdir = git_pathdup_submodule(path, "%s", "");
+	submodule_gitdir = repo_submodule_path(the_repository,
+					       path, "%s", "");
 	if (!submodule_gitdir)
 		return 0;
 
@@ -582,6 +619,7 @@ static void repair_gitfile(struct worktree *wt,
 	struct strbuf backlink = STRBUF_INIT;
 	char *dotgit_contents = NULL;
 	const char *repair = NULL;
+	char *path = NULL;
 	int err;
 
 	/* missing worktree can't be repaired */
@@ -593,7 +631,8 @@ static void repair_gitfile(struct worktree *wt,
 		goto done;
 	}
 
-	strbuf_realpath(&repo, git_common_path("worktrees/%s", wt->id), 1);
+	path = repo_common_path(the_repository, "worktrees/%s", wt->id);
+	strbuf_realpath(&repo, path, 1);
 	strbuf_addf(&dotgit, "%s/.git", wt->path);
 	strbuf_addf(&gitdir, "%s/gitdir", repo.buf);
 	dotgit_contents = xstrdup_or_null(read_gitfile_gently(dotgit.buf, &err));
@@ -623,6 +662,7 @@ static void repair_gitfile(struct worktree *wt,
 
 done:
 	free(dotgit_contents);
+	free(path);
 	strbuf_release(&repo);
 	strbuf_release(&dotgit);
 	strbuf_release(&gitdir);
@@ -654,11 +694,13 @@ void repair_worktree_after_gitdir_move(struct worktree *wt, const char *old_path
 	struct strbuf gitdir = STRBUF_INIT;
 	struct strbuf dotgit = STRBUF_INIT;
 	int is_relative_path;
+	char *path = NULL;
 
 	if (is_main_worktree(wt))
 		goto done;
 
-	strbuf_realpath(&gitdir, git_common_path("worktrees/%s/gitdir", wt->id), 1);
+	path = repo_common_path(the_repository, "worktrees/%s/gitdir", wt->id);
+	strbuf_realpath(&gitdir, path, 1);
 
 	if (strbuf_read_file(&dotgit, gitdir.buf, 0) < 0)
 		goto done;
@@ -677,6 +719,7 @@ void repair_worktree_after_gitdir_move(struct worktree *wt, const char *old_path
 done:
 	strbuf_release(&gitdir);
 	strbuf_release(&dotgit);
+	free(path);
 }
 
 void repair_worktrees_after_gitdir_move(const char *old_path)
@@ -730,8 +773,7 @@ static ssize_t infer_backlink(const char *gitfile, struct strbuf *inferred)
 	id++; /* advance past '/' to point at <id> */
 	if (!*id)
 		goto error;
-	strbuf_reset(inferred);
-	strbuf_git_common_path(inferred, the_repository, "worktrees/%s", id);
+	repo_common_path_replace(the_repository, inferred, "worktrees/%s", id);
 	if (!is_directory(inferred->buf))
 		goto error;
 
@@ -869,7 +911,11 @@ int should_prune_worktree(const char *id, struct strbuf *reason, char **wtpath, 
 	ssize_t read_result;
 
 	*wtpath = NULL;
-	strbuf_realpath(&repo, git_common_path("worktrees/%s", id), 1);
+
+	path = repo_common_path(the_repository, "worktrees/%s", id);
+	strbuf_realpath(&repo, path, 1);
+	FREE_AND_NULL(path);
+
 	strbuf_addf(&gitdir, "%s/gitdir", repo.buf);
 	if (!is_directory(repo.buf)) {
 		strbuf_addstr(reason, _("not a valid directory"));
@@ -945,9 +991,9 @@ done:
 static int move_config_setting(const char *key, const char *value,
 			       const char *from_file, const char *to_file)
 {
-	if (git_config_set_in_file_gently(to_file, key, NULL, value))
+	if (repo_config_set_in_file_gently(the_repository, to_file, key, NULL, value))
 		return error(_("unable to set %s in '%s'"), key, to_file);
-	if (git_config_set_in_file_gently(from_file, key, NULL, NULL))
+	if (repo_config_set_in_file_gently(the_repository, from_file, key, NULL, NULL))
 		return error(_("unable to unset %s in '%s'"), key, from_file);
 	return 0;
 }
@@ -967,7 +1013,7 @@ int init_worktree_config(struct repository *r)
 	 */
 	if (r->repository_format_worktree_config)
 		return 0;
-	if ((res = git_config_set_gently("extensions.worktreeConfig", "true")))
+	if ((res = repo_config_set_gently(the_repository, "extensions.worktreeConfig", "true")))
 		return error(_("failed to set extensions.worktreeConfig setting"));
 
 	common_config_file = xstrfmt("%s/config", r->commondir);
@@ -1031,7 +1077,7 @@ void write_worktree_linking_files(struct strbuf dotgit, struct strbuf gitdir,
 	if (use_relative_paths && !the_repository->repository_format_relative_worktrees) {
 		if (upgrade_repository_format(1) < 0)
 			die(_("unable to upgrade repository format to support relative worktrees"));
-		if (git_config_set_gently("extensions.relativeWorktrees", "true"))
+		if (repo_config_set_gently(the_repository, "extensions.relativeWorktrees", "true"))
 			die(_("unable to set extensions.relativeWorktrees setting"));
 		the_repository->repository_format_relative_worktrees = 1;
 	}
