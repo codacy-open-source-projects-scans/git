@@ -29,7 +29,7 @@ alpine-*)
 	apk add --update shadow sudo meson ninja-build gcc libc-dev curl-dev openssl-dev expat-dev gettext \
 		zlib-ng-dev pcre2-dev python3 musl-libintl perl-utils ncurses \
 		apache2 apache2-http2 apache2-proxy apache2-ssl apache2-webdav apr-util-dbd_sqlite3 \
-		bash cvs gnupg perl-cgi perl-dbd-sqlite perl-io-tty >/dev/null
+		bash cvs gnupg perl-cgi perl-dbd-sqlite perl-io-tty cargo >/dev/null
 	;;
 fedora-*|almalinux-*)
 	case "$jobname" in
@@ -164,10 +164,9 @@ sparse)
 		libexpat-dev gettext zlib1g-dev sparse
 	;;
 Documentation)
-	sudo apt-get -q -y install asciidoc xmlto docbook-xsl-ns make
+	sudo apt-get -q -y install asciidoc xmlto docbook-xsl-ns make ruby \
+		asciidoctor
 
-	test -n "$ALREADY_HAVE_ASCIIDOCTOR" ||
-	sudo gem install --version 1.5.8 asciidoctor
 	sudo gem install concurrent-ruby
 	;;
 esac

@@ -55,6 +55,7 @@ manpages = {
   'git-for-each-ref.adoc' : 1,
   'git-for-each-repo.adoc' : 1,
   'git-format-patch.adoc' : 1,
+  'git-format-rev.adoc' : 1,
   'git-fsck-objects.adoc' : 1,
   'git-fsck.adoc' : 1,
   'git-fsmonitor--daemon.adoc' : 1,
@@ -155,6 +156,7 @@ manpages = {
   'git-update-server-info.adoc' : 1,
   'git-upload-archive.adoc' : 1,
   'git-upload-pack.adoc' : 1,
+  'git-url-parse.adoc' : 1,
   'git-var.adoc' : 1,
   'git-verify-commit.adoc' : 1,
   'git-verify-pack.adoc' : 1,
@@ -377,13 +379,18 @@ foreach manpage, category : manpages
       output: fs.stem(manpage) + '.xml',
     )
 
+    man_base_url = 'file://' + htmldir + '/'
+    if get_option('man_base_url') != ''
+      man_base_url = get_option('man_base_url')
+    endif
+
     doc_targets += custom_target(
       command: [
         xmlto,
         '-m', '@INPUT0@',
         '-m', '@INPUT1@',
         '--stringparam',
-        'man.base.url.for.relative.links=' + get_option('prefix') / get_option('mandir'),
+        'man.base.url.for.relative.links=' + man_base_url,
         'man',
         manpage_xml_target,
         '-o',

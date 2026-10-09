@@ -10,6 +10,7 @@
 #include "object-name.h"
 #include "parse-options.h"
 #include "refs.h"
+#include "stash.h"
 #include "lockfile.h"
 #include "cache-tree.h"
 #include "unpack-trees.h"
@@ -44,7 +45,7 @@
 #define BUILTIN_STASH_POP_USAGE \
 	N_("git stash pop [--index] [-q | --quiet] [<stash>]")
 #define BUILTIN_STASH_APPLY_USAGE \
-	N_("git stash apply [--index] [-q | --quiet] [<stash>]")
+	N_("git stash apply [--index] [-q | --quiet] [--label-ours=<label>] [--label-theirs=<label>] [--label-base=<label>] [<stash>]")
 #define BUILTIN_STASH_BRANCH_USAGE \
 	N_("git stash branch <branchname> [<stash>]")
 #define BUILTIN_STASH_STORE_USAGE \
@@ -372,6 +373,56 @@ static int reset_tree(struct object_id *i_tree, int update, int reset)
 	return 0;
 }
 
+static int create_index_from_tree(const struct object_id *tree_id,
+				  const char *index_path)
+{
+	int nr_trees = 1;
+	int ret = 0;
+	struct unpack_trees_options opts;
+	struct tree_desc t[MAX_UNPACK_TREES];
+	struct tree *tree;
+	struct index_state dst_istate = INDEX_STATE_INIT(the_repository);
+	struct lock_file lock_file = LOCK_INIT;
+
+	repo_read_index_preload(the_repository, NULL, 0);
+	refresh_index(the_repository->index, REFRESH_QUIET, NULL, NULL, NULL);
+
+	hold_lock_file_for_update(&lock_file, index_path, LOCK_DIE_ON_ERROR);
+
+	memset(&opts, 0, sizeof(opts));
+
+	tree = repo_parse_tree_indirect(the_repository, tree_id);
+	if (!tree || repo_parse_tree(the_repository, tree)) {
+		ret = -1;
+		goto done;
+	}
+
+	init_tree_desc(t, &tree->object.oid, tree->buffer, tree->size);
+
+	opts.head_idx = 1;
+	opts.src_index = the_repository->index;
+	opts.dst_index = &dst_istate;
+	opts.merge = 1;
+	opts.reset = UNPACK_RESET_PROTECT_UNTRACKED;
+	opts.fn = oneway_merge;
+
+	if (unpack_trees(nr_trees, t, &opts)) {
+		ret = -1;
+		goto done;
+	}
+
+	if (write_locked_index(&dst_istate, &lock_file, COMMIT_LOCK)) {
+		ret = error(_("unable to write new index file"));
+		goto done;
+	}
+
+done:
+	release_index(&dst_istate);
+	if (ret)
+		rollback_lock_file(&lock_file);
+	return ret;
+}
+
 static int diff_tree_binary(struct strbuf *out, struct object_id *w_commit)
 {
 	struct child_process cp = CHILD_PROCESS_INIT;
@@ -590,8 +641,12 @@ static void unstage_changes_unless_new(struct object_id *orig_tree)
 		die(_("could not write index"));
 }
 
-static int do_apply_stash(const char *prefix, struct stash_info *info,
-			  int index, int quiet)
+static enum stash_apply_result do_apply_stash(const char *prefix,
+					      struct stash_info *info,
+					      int index, int quiet,
+					      const char *label_ours,
+					      const char *label_theirs,
+					      const char *label_base)
 {
 	int clean, ret;
 	int has_index = index;
@@ -643,9 +698,9 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 
 	init_ui_merge_options(&o, the_repository);
 
-	o.branch1 = "Updated upstream";
-	o.branch2 = "Stashed changes";
-	o.ancestor = "Stash base";
+	o.branch1 = label_ours ? label_ours : "Updated upstream";
+	o.branch2 = label_theirs ? label_theirs : "Stashed changes";
+	o.ancestor = label_base ? label_base : "Stash base";
 
 	if (oideq(&info->b_tree, &c_tree))
 		o.branch1 = "Version stash was based on";
@@ -665,8 +720,8 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 
 	/*
 	 * If 'clean' >= 0, reverse the value for 'ret' so 'ret' is 0 when the
-	 * merge was clean, and nonzero if the merge was unclean or encountered
-	 * an error.
+	 * merge was clean, and 1 if the merge was unclean or a negative value
+	 * if it encountered an error.
 	 */
 	ret = clean >= 0 ? !clean : clean;
 
@@ -723,11 +778,18 @@ static int apply_stash(int argc, const char **argv, const char *prefix,
 	int ret = -1;
 	int quiet = 0;
 	int index = use_index;
+	const char *label_ours = NULL, *label_theirs = NULL, *label_base = NULL;
 	struct stash_info info = STASH_INFO_INIT;
 	struct option options[] = {
 		OPT__QUIET(&quiet, N_("be quiet, only report errors")),
 		OPT_BOOL(0, "index", &index,
 			 N_("attempt to recreate the index")),
+		OPT_STRING(0, "label-ours", &label_ours, N_("label"),
+			   N_("label for the upstream side in conflict markers")),
+		OPT_STRING(0, "label-theirs", &label_theirs, N_("label"),
+			   N_("label for the stashed side in conflict markers")),
+		OPT_STRING(0, "label-base", &label_base, N_("label"),
+			   N_("label for the base in diff3 conflict markers")),
 		OPT_END()
 	};
 
@@ -737,7 +799,8 @@ static int apply_stash(int argc, const char **argv, const char *prefix,
 	if (get_stash_info(&info, argc, argv))
 		goto cleanup;
 
-	ret = do_apply_stash(prefix, &info, index, quiet);
+	ret = do_apply_stash(prefix, &info, index, quiet,
+			     label_ours, label_theirs, label_base);
 cleanup:
 	free_stash_info(&info);
 	return ret;
@@ -836,7 +899,8 @@ static int pop_stash(int argc, const char **argv, const char *prefix,
 	if (get_stash_info_assert(&info, argc, argv))
 		goto cleanup;
 
-	if ((ret = do_apply_stash(prefix, &info, index, quiet)))
+	if ((ret = do_apply_stash(prefix, &info, index, quiet,
+				  NULL, NULL, NULL)))
 		printf_ln(_("The stash entry is kept in case "
 			    "you need it again."));
 	else
@@ -877,7 +941,8 @@ static int branch_stash(int argc, const char **argv, const char *prefix,
 	strvec_push(&cp.args, oid_to_hex(&info.b_commit));
 	ret = run_command(&cp);
 	if (!ret)
-		ret = do_apply_stash(prefix, &info, 1, 0);
+		ret = do_apply_stash(prefix, &info, 1, 0,
+				     NULL, NULL, NULL);
 	if (!ret && info.is_stash_ref)
 		ret = do_drop_stash(&info, 0);
 
@@ -1309,18 +1374,26 @@ static int stash_patch(struct stash_info *info, const struct pathspec *ps,
 		       struct interactive_options *interactive_opts)
 {
 	int ret = 0;
-	struct child_process cp_read_tree = CHILD_PROCESS_INIT;
 	struct child_process cp_diff_tree = CHILD_PROCESS_INIT;
+	struct commit *head_commit;
+	const struct object_id *head_tree;
 	struct index_state istate = INDEX_STATE_INIT(the_repository);
 	char *old_index_env = NULL, *old_repo_index_file;
 
 	remove_path(stash_index_path.buf);
 
-	cp_read_tree.git_cmd = 1;
-	strvec_pushl(&cp_read_tree.args, "read-tree", "HEAD", NULL);
-	strvec_pushf(&cp_read_tree.env, "GIT_INDEX_FILE=%s",
-		     stash_index_path.buf);
-	if (run_command(&cp_read_tree)) {
+	head_commit = lookup_commit(the_repository, &info->b_commit);
+	if (!head_commit || repo_parse_commit(the_repository, head_commit)) {
+		ret = -1;
+		goto done;
+	}
+	head_tree = get_commit_tree_oid(head_commit);
+	if (!head_tree) {
+		ret = -1;
+		goto done;
+	}
+
+	if (create_index_from_tree(head_tree, stash_index_path.buf)) {
 		ret = -1;
 		goto done;
 	}
@@ -1632,8 +1705,8 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
 
-		/* TODO: audit for interaction with sparse-index. */
-		ensure_full_index(the_repository->index);
+		if (pathspec_needs_expanded_index(the_repository->index, ps))
+			ensure_full_index(the_repository->index);
 		for (size_t i = 0; i < the_repository->index->cache_nr; i++)
 			ce_path_match(the_repository->index, the_repository->index->cache[i], ps,
 				      ps_matched);
@@ -2422,10 +2495,22 @@ int cmd_stash(int argc,
 	strbuf_addf(&stash_index_path, "%s.stash.%" PRIuMAX, index_file,
 		    (uintmax_t)pid);
 
-	if (fn)
-		return !!fn(argc, argv, prefix, repo);
-	else if (!argc)
+	if (fn) {
+		ret = fn(argc, argv, prefix, repo);
+
+		/*
+		 * The subcommand implementations return 0 on success, a
+		 * negative value on failure, and STASH_APPLY_CONFLICT
+		 * when applying a stash entry resulted in conflicts.
+		 * Map failures to 128, the status die() uses, so that
+		 * exit status 1 unambiguously indicates conflicts.
+		 */
+		if (ret < 0)
+			return 128;
+		return ret;
+	} else if (!argc) {
 		return !!push_stash_unassumed(0, NULL, prefix, repo);
+	}
 
 	/* Assume 'stash push' */
 	strvec_push(&args, "push");

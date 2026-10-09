@@ -60,8 +60,8 @@ static int diff_suppress_blank_empty;
 static enum git_colorbool diff_use_color_default = GIT_COLOR_UNKNOWN;
 static int diff_color_moved_default;
 static int diff_color_moved_ws_default;
-static int diff_context_default = 3;
-static int diff_interhunk_context_default;
+static unsigned int diff_context_default = 3;
+static unsigned int diff_interhunk_context_default;
 static char *diff_word_regex_cfg;
 static struct external_diff external_diff_cfg;
 static char *diff_order_file_cfg;
@@ -382,16 +382,17 @@ int git_diff_ui_config(const char *var, const char *value,
 		return 0;
 	}
 	if (!strcmp(var, "diff.context")) {
-		diff_context_default = git_config_int(var, value, ctx->kvi);
-		if (diff_context_default < 0)
+		int val = git_config_int(var, value, ctx->kvi);
+		if (val < 0)
 			return -1;
+		diff_context_default = val;
 		return 0;
 	}
 	if (!strcmp(var, "diff.interhunkcontext")) {
-		diff_interhunk_context_default = git_config_int(var, value,
-								ctx->kvi);
-		if (diff_interhunk_context_default < 0)
+		int val = git_config_int(var, value, ctx->kvi);
+		if (val < 0)
 			return -1;
+		diff_interhunk_context_default = val;
 		return 0;
 	}
 	if (!strcmp(var, "diff.renames")) {
@@ -2927,6 +2928,28 @@ void print_stat_summary(FILE *fp, int files,
 	print_stat_summary_inserts_deletes(&o, files, insertions, deletions);
 }
 
+/*
+ * Like utf8_width(), but guaranteed safe for use in loops that subtract
+ * per-character widths:
+ *
+ *   - utf8_width() sets *start to NULL on invalid UTF-8 and returns 0;
+ *     we restore the pointer and advance by one byte, returning width 1
+ *     (matching the strlen()-based fallback in utf8_strwidth()).
+ *
+ *   - utf8_width() returns -1 for control characters; we return 0
+ *     (matching utf8_strnwidth() which skips them).
+ */
+static int utf8_ish_width(const char **start)
+{
+	const char *old = *start;
+	int w = utf8_width(start, NULL);
+	if (!*start) {
+		*start = old + 1;
+		return 1;
+	}
+	return (w < 0) ? 0 : w;
+}
+
 static void show_stats(struct diffstat_t *data, struct diff_options *options)
 {
 	int i, len, add, del, adds = 0, dels = 0;
@@ -3093,8 +3116,8 @@ static void show_stats(struct diffstat_t *data, struct diff_options *options)
 			if (len < 0)
 				len = 0;
 
-			while (name_len > len)
-				name_len -= utf8_width((const char**)&name, NULL);
+			while (name_len > len && *name)
+				name_len -= utf8_ish_width((const char**)&name);
 
 			slash = strchr(name, '/');
 			if (slash)
@@ -3496,29 +3519,6 @@ struct checkdiff_t {
 	int last_line_kind;
 };
 
-static int is_conflict_marker(const char *line, int marker_size, unsigned long len)
-{
-	char firstchar;
-	int cnt;
-
-	if (len < marker_size + 1)
-		return 0;
-	firstchar = line[0];
-	switch (firstchar) {
-	case '=': case '>': case '<': case '|':
-		break;
-	default:
-		return 0;
-	}
-	for (cnt = 1; cnt < marker_size; cnt++)
-		if (line[cnt] != firstchar)
-			return 0;
-	/* line[1] through line[marker_size-1] are same as firstchar */
-	if (len < marker_size + 1 || !isspace(line[marker_size]))
-		return 0;
-	return 1;
-}
-
 static void checkdiff_consume_hunk(void *priv,
 				   long ob UNUSED, long on UNUSED,
 				   long nb, long nn UNUSED,
@@ -3548,7 +3548,7 @@ static int checkdiff_consume(void *priv, char *line, unsigned long len)
 	if (line[0] == '+') {
 		unsigned bad;
 		data->lineno++;
-		if (is_conflict_marker(line + 1, marker_size, len - 1)) {
+		if (is_conflict_marker_line(line + 1, len - 1, marker_size)) {
 			data->status |= 1;
 			fprintf(data->o->file,
 				"%s%s:%d: leftover conflict marker\n",
@@ -3586,11 +3586,12 @@ static unsigned char *deflate_it(char *data,
 				 unsigned long size,
 				 unsigned long *result_size)
 {
-	int bound;
+	size_t bound;
 	unsigned char *deflated;
 	git_zstream stream;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
 
-	git_deflate_init(&stream, zlib_compression_level);
+	git_deflate_init(&stream, cfg->zlib_compression_level);
 	bound = git_deflate_bound(&stream, size);
 	deflated = xmalloc(bound);
 	stream.next_out = deflated;
@@ -3623,9 +3624,11 @@ static void emit_binary_diff_body(struct diff_options *o,
 	delta = NULL;
 	deflated = deflate_it(two->ptr, two->size, &deflate_size);
 	if (one->size && two->size) {
+		size_t delta_size_st = 0;
 		delta = diff_delta(one->ptr, one->size,
 				   two->ptr, two->size,
-				   &delta_size, deflate_size);
+				   &delta_size_st, deflate_size);
+		delta_size = cast_size_t_to_ulong(delta_size_st);
 		if (delta) {
 			void *to_free = delta;
 			orig_size = delta_size;
@@ -4571,8 +4574,9 @@ int diff_populate_filespec(struct repository *r,
 		}
 	}
 	else {
+		size_t size_st = 0;
 		struct object_info info = {
-			.sizep = &s->size
+			.sizep = &size_st
 		};
 
 		if (!(size_only || check_binary))
@@ -4594,6 +4598,7 @@ int diff_populate_filespec(struct repository *r,
 			die("unable to read %s", oid_to_hex(&s->oid));
 
 object_read:
+		s->size = cast_size_t_to_ulong(size_st);
 		if (size_only || check_binary) {
 			if (size_only)
 				return 0;
@@ -4608,6 +4613,7 @@ object_read:
 			if (odb_read_object_info_extended(r->objects, &s->oid, &info,
 							  OBJECT_INFO_LOOKUP_REPLACE))
 				die("unable to read %s", oid_to_hex(&s->oid));
+			s->size = cast_size_t_to_ulong(size_st);
 		}
 		s->should_free = 1;
 	}
@@ -5924,9 +5930,12 @@ static int diff_opt_unified(const struct option *opt,
 	BUG_ON_OPT_NEG(unset);
 
 	if (arg) {
-		options->context = strtol(arg, &s, 10);
+		long val = strtol(arg, &s, 10);
 		if (*s)
 			return error(_("%s expects a numerical value"), "--unified");
+		if (val < 0)
+			return error(_("%s expects a non-negative integer"), "--unified");
+		options->context = val;
 	}
 	enable_patch_output(&options->output_format);
 
@@ -6111,9 +6120,8 @@ struct option *add_diff_options(const struct option *opts,
 		OPT_CALLBACK_F(0, "default-prefix", options, NULL,
 			       N_("use default prefixes a/ and b/"),
 			       PARSE_OPT_NONEG | PARSE_OPT_NOARG, diff_opt_default_prefix),
-		OPT_INTEGER_F(0, "inter-hunk-context", &options->interhunkcontext,
-			      N_("show context between diff hunks up to the specified number of lines"),
-			      PARSE_OPT_NONEG),
+		OPT_UNSIGNED(0, "inter-hunk-context", &options->interhunkcontext,
+			     N_("show context between diff hunks up to the specified number of lines")),
 		OPT_CALLBACK_F(0, "output-indicator-new",
 			       &options->output_indicators[OUTPUT_INDICATOR_NEW],
 			       N_("<char>"),
@@ -6157,7 +6165,7 @@ struct option *add_diff_options(const struct option *opts,
 			       N_("continue listing the history of a file beyond renames"),
 			       PARSE_OPT_NOARG, diff_opt_follow),
 		OPT_INTEGER('l', NULL, &options->rename_limit,
-			    N_("prevent rename/copy detection if the number of rename/copy targets exceeds given limit")),
+			    N_("limit to cheap rename/copy detection if the number of rename/copy targets exceeds this value")),
 
 		OPT_GROUP(N_("Diff algorithm options")),
 		OPT_CALLBACK_F(0, "minimal", options, NULL,
@@ -6826,7 +6834,7 @@ void flush_one_hunk(struct object_id *result, struct git_hash_ctx *ctx)
 	int i;
 
 	git_hash_final(hash, ctx);
-	the_hash_algo->init_fn(ctx);
+	git_hash_init(ctx, the_hash_algo);
 	/* 20-byte sum, with carry */
 	for (i = 0; i < the_hash_algo->rawsz; ++i) {
 		carry += result->hash[i] + hash[i];
@@ -6870,7 +6878,7 @@ static int diff_get_patch_id(struct diff_options *options, struct object_id *oid
 	struct git_hash_ctx ctx;
 	struct patch_id_t data;
 
-	the_hash_algo->init_fn(&ctx);
+	git_hash_init(&ctx, the_hash_algo);
 	memset(&data, 0, sizeof(struct patch_id_t));
 	data.ctx = &ctx;
 	oidclr(oid, the_repository->hash_algo);
@@ -6958,6 +6966,7 @@ static int diff_get_patch_id(struct diff_options *options, struct object_id *oid
 		flush_one_hunk(oid, &ctx);
 	}
 
+	git_hash_discard(&ctx);
 	return 0;
 }
 

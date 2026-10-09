@@ -7,6 +7,19 @@ struct repository;
 struct rev_info;
 
 /*
+ * Controls what happens when a replayed commit becomes empty (i.e. its tree
+ * is identical to its parent's tree after the replay).
+ */
+enum replay_empty_commit_action {
+	/* Silently discard the empty commit. */
+	REPLAY_EMPTY_COMMIT_DROP,
+	/* Keep the empty commit as-is. */
+	REPLAY_EMPTY_COMMIT_KEEP,
+	/* Abort with an error. */
+	REPLAY_EMPTY_COMMIT_ABORT,
+};
+
+/*
  * A set of options that can be passed to `replay_revisions()`.
  */
 struct replay_revisions_options {
@@ -19,7 +32,7 @@ struct replay_revisions_options {
 
 	/*
 	 * Starting point at which to create the new commits; must be a
-	 * committish. References pointing at decendants of `onto` will be
+	 * committish. References pointing at descendants of `onto` will be
 	 * updated to point to the new commits.
 	 */
 	const char *onto;
@@ -43,6 +56,17 @@ struct replay_revisions_options {
 	 * Requires `onto` to be set.
 	 */
 	int contained;
+
+	/*
+	 * Controls what to do when a replayed commit becomes empty.
+	 * Defaults to REPLAY_EMPTY_COMMIT_DROP.
+	 */
+	enum replay_empty_commit_action empty;
+
+	/*
+	 * Whether to linearize the commits (i.e. drop merge commits).
+	 */
+	int linearize;
 };
 
 /* This struct is used as an out-parameter by `replay_revisions()`. */
@@ -60,6 +84,11 @@ struct replay_result {
 };
 
 void replay_result_release(struct replay_result *result);
+
+void replay_result_queue_update(struct replay_result *result,
+				const char *refname,
+				const struct object_id *old_oid,
+				const struct object_id *new_oid);
 
 /*
  * Replay a set of commits onto a new location. Leaves both the working tree,

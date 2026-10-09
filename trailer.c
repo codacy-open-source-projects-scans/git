@@ -635,8 +635,12 @@ static ssize_t find_separator(const char *line, const char *separators)
 	int whitespace_found = 0;
 	const char *c;
 	for (c = line; *c; c++) {
-		if (strchr(separators, *c))
+		if (strchr(separators, *c)) {
+			/* avoid accidental URL matches */
+			if (!whitespace_found && starts_with(c, "://"))
+				return -1;
 			return c - line;
+		}
 		if (!whitespace_found && (isalnum(*c) || *c == '-'))
 			continue;
 		if (c != line && (*c == ' ' || *c == '\t')) {
@@ -988,10 +992,9 @@ static int ends_with_blank_line(const char *buf, size_t len)
 
 static void unfold_value(struct strbuf *val)
 {
-	struct strbuf out = STRBUF_INIT;
 	size_t i;
+	size_t pos = 0;
 
-	strbuf_grow(&out, val->len);
 	i = 0;
 	while (i < val->len) {
 		char c = val->buf[i++];
@@ -999,18 +1002,14 @@ static void unfold_value(struct strbuf *val)
 			/* Collapse continuation down to a single space. */
 			while (i < val->len && isspace(val->buf[i]))
 				i++;
-			strbuf_addch(&out, ' ');
-		} else {
-			strbuf_addch(&out, c);
+			c = ' ';
 		}
+		val->buf[pos++] = c;
 	}
+	strbuf_setlen(val, pos);
 
 	/* Empty lines may have left us with whitespace cruft at the edges */
-	strbuf_trim(&out);
-
-	/* output goes back to val as if we modified it in-place */
-	strbuf_swap(&out, val);
-	strbuf_release(&out);
+	strbuf_trim(val);
 }
 
 static struct trailer_block *trailer_block_new(void)

@@ -122,8 +122,8 @@ test_expect_success_multiple () {
 	fi
 	testname="$1" expect_all="$2" code="$3"
 
-	expect_verbose=$( echo "$expect_all" | grep -v '^::	' )
-	expect=$( echo "$expect_verbose" | sed -e 's/.*	//' )
+	expect_verbose=$(echo "$expect_all" | grep -v '^::	' || :)
+	expect=$(echo "$expect_verbose" | sed -e 's/.*	//')
 
 	test_expect_success $prereq "$testname${no_index_opt:+ with $no_index_opt}" '
 		expect "$expect" &&
@@ -790,8 +790,8 @@ test_expect_success 'existing file and directory' '
 	>one &&
 	mkdir top-level-dir &&
 	git check-ignore one top-level-dir >actual &&
-	grep one actual &&
-	grep top-level-dir actual
+	test_grep one actual &&
+	test_grep top-level-dir actual
 '
 
 test_expect_success 'existing directory and file' '
@@ -800,8 +800,8 @@ test_expect_success 'existing directory and file' '
 	>one &&
 	mkdir top-level-dir &&
 	git check-ignore top-level-dir one >actual &&
-	grep one actual &&
-	grep top-level-dir actual
+	test_grep one actual &&
+	test_grep top-level-dir actual
 '
 
 test_expect_success 'exact prefix matching (with root)' '

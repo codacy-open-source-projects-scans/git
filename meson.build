@@ -161,6 +161,21 @@
 # These machine files can be passed to `meson setup` via the `--native-file`
 # option.
 #
+# Fuzzing
+# =======
+#
+# Meson supports building the fuzzing targets by setting `-Dfuzzers=true`. By
+# default, the targets will be built without libFuzzer and thus won't be usable
+# for fuzzing. You have to configure a couple of options to properly wire up
+# libFuzzer:
+#
+#   $ meson setup build-fuzzers \
+#       -Db_sanitize=address,fuzzer-no-link \
+#       -Dfuzzers=true \
+#       -Dfuzzers_link_args=-fsanitize=fuzzer
+#   $ meson compile -C build-fuzzers
+#   $ ./build-fuzzers/oss-fuzz/fuzz-config <args>
+#
 # Cross compilation
 # =================
 #
@@ -278,7 +293,20 @@ compat_sources = [
   'compat/terminal.c',
 ]
 
+hook_list = custom_target(
+  input: 'Documentation/githooks.adoc',
+  output: 'hook-list.h',
+  command: [
+    shell,
+    meson.current_source_dir() + '/tools/generate-hooklist.sh',
+    meson.current_source_dir(),
+    '@OUTPUT@',
+  ],
+  env: script_environment,
+)
+
 libgit_sources = [
+  hook_list,
   'abspath.c',
   'add-interactive.c',
   'add-patch.c',
@@ -346,6 +374,7 @@ libgit_sources = [
   'ewah/ewah_rlw.c',
   'exec-cmd.c',
   'fetch-negotiator.c',
+  'fetch-object-info.c',
   'fetch-pack.c',
   'fmt-merge-msg.c',
   'fsck.c',
@@ -404,7 +433,11 @@ libgit_sources = [
   'odb.c',
   'odb/source.c',
   'odb/source-files.c',
+  'odb/source-inmemory.c',
+  'odb/source-loose.c',
+  'odb/source-packed.c',
   'odb/streaming.c',
+  'odb/transaction.c',
   'oid-array.c',
   'oidmap.c',
   'oidset.c',
@@ -418,6 +451,7 @@ libgit_sources = [
   'pack-revindex.c',
   'pack-write.c',
   'packfile.c',
+  'packfile-list.c',
   'pager.c',
   'parallel-checkout.c',
   'parse.c',
@@ -564,6 +598,7 @@ libgit_sources += custom_target(
 )
 
 builtin_sources = [
+  hook_list,
   'builtin/add.c',
   'builtin/am.c',
   'builtin/annotate.c',
@@ -686,6 +721,7 @@ builtin_sources = [
   'builtin/update-server-info.c',
   'builtin/upload-archive.c',
   'builtin/upload-pack.c',
+  'builtin/url-parse.c',
   'builtin/var.c',
   'builtin/verify-commit.c',
   'builtin/verify-pack.c',
@@ -698,7 +734,6 @@ third_party_excludes = [
   ':!contrib',
   ':!compat/inet_ntop.c',
   ':!compat/inet_pton.c',
-  ':!compat/nedmalloc',
   ':!compat/obstack.*',
   ':!compat/poll',
   ':!compat/regex',
@@ -735,18 +770,6 @@ builtin_sources += custom_target(
     meson.current_source_dir(),
     '@OUTPUT@',
     '@DEPFILE@',
-  ],
-  env: script_environment,
-)
-
-builtin_sources += custom_target(
-  input: 'Documentation/githooks.adoc',
-  output: 'hook-list.h',
-  command: [
-    shell,
-    meson.current_source_dir() + '/tools/generate-hooklist.sh',
-    meson.current_source_dir(),
-    '@OUTPUT@',
   ],
   env: script_environment,
 )
@@ -866,6 +889,12 @@ if get_option('warning_level') in ['2','3', 'everything'] and compiler.get_argum
       libgit_c_args += cflag
     endif
   endforeach
+
+  # Clang generates warnings when compiling glibc 2.43 because of the use of
+  # _Generic.
+  if compiler.get_id() == 'clang'
+    libgit_c_args += '-Wno-c11-extensions'
+  endif
 endif
 
 if get_option('breaking_changes')
@@ -1285,12 +1314,10 @@ elif host_machine.system() == 'windows'
     'compat/win32/pthread.c',
     'compat/win32/syslog.c',
     'compat/win32mmap.c',
-    'compat/nedmalloc/nedmalloc.c',
   ]
 
   libgit_c_args += [
     '-DDETECT_MSYS_TTY',
-    '-DENSURE_MSYSTEM_IS_SET',
     '-DNATIVE_CRLF',
     '-DNOGDI',
     '-DNO_POSIX_GOODIES',
@@ -1299,6 +1326,20 @@ elif host_machine.system() == 'windows'
     '-D_CONSOLE_DETECT_MSYS_TTY',
     '-D__USE_MINGW_ANSI_STDIO=0',
   ]
+
+  msystem = get_option('msystem')
+  if msystem != ''
+    mingw_prefix = get_option('mingw_prefix')
+    if mingw_prefix == ''
+      mingw_prefix = msystem.to_lower()
+    elif mingw_prefix.startswith('/')
+      mingw_prefix = mingw_prefix.substring(1)
+    endif
+    libgit_c_args += [
+      '-DENSURE_MSYSTEM_IS_SET="' + msystem + '"',
+      '-DMINGW_PREFIX="' + mingw_prefix + '"'
+    ]
+  endif
 
   libgit_dependencies += compiler.find_library('ntdll')
   libgit_include_directories += 'compat/win32'
@@ -1344,10 +1385,17 @@ else
 endif
 
 fsmonitor_backend = ''
+fsmonitor_os = ''
 if host_machine.system() == 'windows'
   fsmonitor_backend = 'win32'
+  fsmonitor_os = 'win32'
+elif host_machine.system() == 'linux' and threads.found() and compiler.has_header('linux/magic.h')
+  fsmonitor_backend = 'linux'
+  fsmonitor_os = 'unix'
+  libgit_c_args += '-DHAVE_LINUX_MAGIC_H'
 elif host_machine.system() == 'darwin'
   fsmonitor_backend = 'darwin'
+  fsmonitor_os = 'unix'
   libgit_dependencies += dependency('CoreServices')
 endif
 if fsmonitor_backend != ''
@@ -1356,14 +1404,14 @@ if fsmonitor_backend != ''
 
   compat_sources += [
     'compat/fsmonitor/fsm-health-' + fsmonitor_backend + '.c',
-    'compat/fsmonitor/fsm-ipc-' + fsmonitor_backend + '.c',
+    'compat/fsmonitor/fsm-ipc-' + fsmonitor_os + '.c',
     'compat/fsmonitor/fsm-listen-' + fsmonitor_backend + '.c',
     'compat/fsmonitor/fsm-path-utils-' + fsmonitor_backend + '.c',
-    'compat/fsmonitor/fsm-settings-' + fsmonitor_backend + '.c',
+    'compat/fsmonitor/fsm-settings-' + fsmonitor_os + '.c',
   ]
 endif
 build_options_config.set_quoted('FSMONITOR_DAEMON_BACKEND', fsmonitor_backend)
-build_options_config.set_quoted('FSMONITOR_OS_SETTINGS', fsmonitor_backend)
+build_options_config.set_quoted('FSMONITOR_OS_SETTINGS', fsmonitor_os)
 
 if not get_option('b_sanitize').contains('address') and get_option('regex').allowed() and compiler.has_header('regex.h') and compiler.get_define('REG_STARTEND', prefix: '#include <regex.h>') != ''
   build_options_config.set('NO_REGEX', '')
@@ -1429,6 +1477,7 @@ checkfuncs = {
   'initgroups' : [],
   'strtoumax' : ['strtoumax.c', 'strtoimax.c'],
   'pread' : ['pread.c'],
+  'writev' : ['writev.c'],
 }
 
 if host_machine.system() == 'windows'
@@ -1744,8 +1793,7 @@ version_def_h = custom_target(
 )
 libgit_sources += version_def_h
 
-cargo = find_program('cargo', dirs: program_path, native: true, required: get_option('rust'))
-rust_option = get_option('rust').disable_auto_if(not cargo.found())
+rust_option = get_option('rust')
 if rust_option.allowed()
   subdir('src')
   libgit_c_args += '-DWITH_RUST'

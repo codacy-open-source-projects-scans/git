@@ -11,8 +11,7 @@ if ! test_have_prereq PERL; then
 	test_done
 fi
 
-cvs >/dev/null 2>&1
-if test $? -ne 1
+if ! cvs version >/dev/null 2>&1
 then
     skip_all='skipping git cvsexportcommit tests, cvs not found'
     test_done
@@ -337,7 +336,7 @@ test_expect_success 'use the same checkout for Git and CVS' '
 	 echo Hello >> " space" &&
 	 git commit -m "Another change" " space" &&
 	 git cvsexportcommit -W -p -u -c HEAD &&
-	 grep Hello " space" &&
+	 test_grep Hello " space" &&
 	 git diff-files)
 
 '

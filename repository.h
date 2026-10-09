@@ -2,6 +2,7 @@
 #define REPOSITORY_H
 
 #include "strmap.h"
+#include "string-list.h"
 #include "repo-settings.h"
 #include "environment.h"
 
@@ -50,6 +51,14 @@ struct repository {
 	 * Cannot be NULL after initialization.
 	 */
 	char *commondir;
+
+	/*
+	 * The "prefix", a path to the current working directory relative to
+	 * the work tree root, or NULL, if the current working directory is not
+	 * a strict subdirectory of the work tree root. The prefix always ends
+	 * with a '/' character.
+	 */
+	char *prefix;
 
 	/*
 	 * Holds any information related to accessing the raw object content.
@@ -113,6 +122,15 @@ struct repository {
 	 * A NULL value indicates that there is no working directory.
 	 */
 	char *worktree;
+	bool worktree_initialized;
+	bool worktree_config_is_bogus;
+
+	/*
+	 * Whether the repository is bare, as set by "core.bare" config or
+	 * inferred during repository discovery. -1 means unset/unknown, 0
+	 * means non-bare, 1 means bare.
+	 */
+	int bare_cfg;
 
 	/*
 	 * Path from the root of the top-level superproject down to this
@@ -149,7 +167,7 @@ struct repository {
 	/* Repository's compatibility hash algorithm. */
 	const struct git_hash_algo *compat_hash_algo;
 
-	/* Repository's config values parsed by git_default_config() */
+	/* Repository-specific configuration values. */
 	struct repo_config_values config_values_private_;
 
 	/* Repository's reference storage format, as serialized on disk. */
@@ -167,10 +185,25 @@ struct repository {
 	int commit_graph_disabled;
 
 	/*
+	 * Controls whether the repository should lazily fetch missing
+	 * objects from promisor remotes. Defaults to 1.
+	 */
+	int fetch_if_missing;
+
+	/*
 	 * Lazily-populated cache mapping hook event names to configured hooks.
 	 * NULL until first hook use.
 	 */
 	struct strmap *hook_config_cache;
+
+	/* Cached value of hook.jobs config (0 if unset, defaults to serial). */
+	unsigned int hook_jobs;
+
+	/* Cached map of event-name -> jobs count (as uintptr_t) from hook.<event>.jobs. */
+	struct strmap event_jobs;
+
+	/* Cached list of event names with hook.<event>.enabled = false. */
+	struct string_list disabled_events;
 
 	/* Configurations related to promisor remotes. */
 	char *repository_format_partial_clone;
@@ -209,12 +242,9 @@ const char *repo_get_work_tree(struct repository *repo);
  */
 struct set_gitdir_args {
 	const char *commondir;
-	const char *object_dir;
 	const char *graft_file;
 	const char *index_file;
-	const char *alternate_db;
 	bool disable_ref_updates;
-	bool skip_initializing_odb;
 };
 
 void repo_set_gitdir(struct repository *repo, const char *root,
@@ -269,6 +299,6 @@ void repo_update_index_if_able(struct repository *, struct lock_file *);
  * Return 1 if upgrade repository format to target_version succeeded,
  * 0 if no upgrade is necessary, and -1 when upgrade is not possible.
  */
-int upgrade_repository_format(int target_version);
+int upgrade_repository_format(struct repository *repo, int target_version);
 
 #endif /* REPOSITORY_H */
